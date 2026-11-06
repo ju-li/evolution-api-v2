@@ -6,9 +6,9 @@
   "type": "commonjs",
   "scripts": {
     "build": "tsc --noEmit && tsup",
-    "start": "tsx ./src/main.ts",
+    "start": "tsup && node dist/main",
     "start:prod": "node dist/main",
-    "dev:server": "tsx watch ./src/main.ts",
+    "dev:server": "tsup --watch src",
     "test": "tsx watch ./test/all.test.ts",
     "lint": "eslint --fix --ext .ts src",
     "lint:check": "eslint --ext .ts src",
