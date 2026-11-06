@@ -268,9 +268,11 @@ export class EvolutionStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.CHATS_UPDATE, chatRaw);
 
       await this.prismaRepository.chat.updateMany({
-        where: { remoteJid: chat.remoteJid },
+        where: { instanceId: this.instanceId, remoteJid: chat.remoteJid },
         data: chatRaw,
       });
+
+      return;
     }
 
     const chatRaw: any = {
