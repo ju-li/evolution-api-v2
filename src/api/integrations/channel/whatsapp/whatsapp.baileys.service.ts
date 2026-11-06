@@ -252,6 +252,20 @@ export class BaileysStartupService extends ChannelStartupService {
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
+  /**
+   * Socket lifecycle guards (see #4).
+   * - clientGeneration increases every time the current socket is torn down or replaced. Event handlers capture the
+   *   generation of the socket they were attached to and ignore events once it is no longer current, so a late
+   *   `close` from a replaced socket can never trigger another reconnect.
+   * - clientEventsUnsubscribe detaches the current socket's ev.process handler.
+   * - clientCreation serialises socket creation: concurrent callers share the in-flight creation instead of
+   *   building a second socket on the same credentials.
+   */
+  private clientGeneration = 0;
+  private clientEventsUnsubscribe?: () => void;
+  private clientCreation: Promise<WASocket> | null = null;
+  private voiceCallsSocket?: Promise<{ disconnect: () => unknown }>;
+
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
@@ -331,7 +345,15 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate(
+    { qr, connection, lastDisconnect }: Partial<ConnectionState>,
+    generation = this.clientGeneration,
+  ) {
+    if (generation !== this.clientGeneration) {
+      // Event from a socket that has already been replaced or torn down.
+      return;
+    }
+
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -428,6 +450,9 @@ export class BaileysStartupService extends ChannelStartupService {
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       if (shouldReconnect) {
+        if (generation !== this.clientGeneration) {
+          return;
+        }
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
@@ -573,7 +598,68 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * Tears down the current socket so it can never act on this instance again: its event handlers are detached
+   * BEFORE it is ended, so the `close` that `end()` emits cannot reach connectionUpdate and trigger a reconnect.
+   */
+  private teardownClient() {
+    const previous = this.client;
+
+    this.clientGeneration++;
+    this.clientEventsUnsubscribe?.();
+    this.clientEventsUnsubscribe = undefined;
+
+    const voiceCallsSocket = this.voiceCallsSocket;
+    this.voiceCallsSocket = undefined;
+    voiceCallsSocket
+      ?.then((socket) => socket?.disconnect())
+      .catch((error) => this.logger.warn(`Failed to disconnect Wavoip socket: ${error?.message ?? error}`));
+
+    if (!previous) {
+      return;
+    }
+
+    try {
+      previous.ws?.removeAllListeners('CB:call');
+      previous.ws?.removeAllListeners('CB:ack,class:call');
+    } catch {
+      // ignore
+    }
+
+    try {
+      Promise.resolve(previous.end(undefined)).catch((error) =>
+        this.logger.warn(`Error ending replaced socket: ${error?.message ?? error}`),
+      );
+    } catch (error) {
+      this.logger.warn(`Error ending replaced socket: ${error?.message ?? error}`);
+    }
+  }
+
+  /**
+   * Serialises socket creation per instance. While a creation is in flight, every caller (reconnect after a close,
+   * GET /instance/connect, restart, reloadConnection) awaits the same promise instead of creating a second socket.
+   */
+  private createClientSerialised(create: () => Promise<WASocket>): Promise<WASocket> {
+    if (this.clientCreation) {
+      this.logger.verbose('Socket creation already in progress, reusing it');
+      return this.clientCreation;
+    }
+
+    const creation = create().finally(() => {
+      if (this.clientCreation === creation) {
+        this.clientCreation = null;
+      }
+    });
+    this.clientCreation = creation;
+
+    return creation;
+  }
+
   private async createClient(number?: string): Promise<WASocket> {
+    // Never leave the previous socket alive on the same credentials: two sockets on one set of creds replace each
+    // other with 440 (conflict) forever.
+    this.teardownClient();
+
     this.instance.authState = await this.defineAuthState();
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
@@ -695,21 +781,29 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
-    this.client = makeWASocket(socketConfig);
+    const client = makeWASocket(socketConfig);
+    const generation = ++this.clientGeneration;
+    this.client = client;
+
+    // Report 'connecting' right away: until Baileys' first connection.update arrives the state would otherwise still
+    // read 'close', and GET /instance/connect would start yet another socket.
+    this.stateConnection = { state: 'connecting', statusReason: 200 };
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
-      useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any);
+      this.voiceCallsSocket = useVoiceCallsBaileys(this.localSettings.wavoipToken, client, 'connecting');
     }
 
-    this.eventHandler();
+    this.eventHandler(client, generation);
 
-    this.client.ws.on('CB:call', (packet) => {
+    client.ws.on('CB:call', (packet) => {
+      if (generation !== this.clientGeneration) return;
       this.logger.verbose({ event: 'CB:call', packet });
       const payload = { event: 'CB:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
 
-    this.client.ws.on('CB:ack,class:call', (packet) => {
+    client.ws.on('CB:ack,class:call', (packet) => {
+      if (generation !== this.clientGeneration) return;
       this.logger.verbose({ event: 'CB:ack,class:call', packet });
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
@@ -717,22 +811,24 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.phoneNumber = number;
 
-    return this.client;
+    return client;
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     try {
-      this.loadChatwoot();
-      this.loadSettings();
-      this.loadWebhook();
-      this.loadProxy();
+      return await this.createClientSerialised(async () => {
+        this.loadChatwoot();
+        this.loadSettings();
+        this.loadWebhook();
+        this.loadProxy();
 
-      // Remontar o messageProcessor para garantir que está funcionando após reconexão
-      this.messageProcessor.mount({
-        onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+        // Remontar o messageProcessor para garantir que está funcionando após reconexão
+        this.messageProcessor.mount({
+          onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+        });
+
+        return await this.createClient(number);
       });
-
-      return await this.createClient(number);
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
@@ -741,7 +837,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async reloadConnection(): Promise<WASocket> {
     try {
-      return await this.createClient(this.phoneNumber);
+      return await this.createClientSerialised(() => this.createClient(this.phoneNumber));
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
@@ -1878,10 +1974,19 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
-  private eventHandler() {
-    this.client.ev.process(async (events) => {
+  private eventHandler(client: WASocket, generation: number) {
+    this.clientEventsUnsubscribe = client.ev.process(async (events) => {
+      if (generation !== this.clientGeneration) {
+        return;
+      }
+
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
+          // Re-check when dequeued: the socket may have been replaced while earlier events were being processed.
+          if (generation !== this.clientGeneration) {
+            return;
+          }
+
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();
@@ -1906,7 +2011,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
+              this.connectionUpdate(events['connection.update'], generation);
             }
 
             if (events['creds.update']) {
