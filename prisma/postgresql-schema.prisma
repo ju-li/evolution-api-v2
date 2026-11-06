@@ -131,6 +131,11 @@ model Chat {
   Instance       Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId     String
   unreadMessages Int       @default(0)
+  archived       Boolean   @default(false)
+  pinned         Boolean   @default(false)
+  /// Mute end timestamp as sent by WhatsApp (-1 = muted forever, null = not muted).
+  muteEndTime    BigInt?
+  markedAsUnread Boolean   @default(false)
 
   @@unique([instanceId, remoteJid])
   @@index([instanceId])
