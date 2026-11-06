@@ -5016,15 +5016,7 @@ export class BaileysStartupService extends ChannelStartupService {
   public async fetchMessages(query: Query<Message>) {
     const keyFilters = query?.where?.key as ExtendedIMessageKey;
 
-    const timestampFilter = {};
-    if (query?.where?.messageTimestamp) {
-      if (query.where.messageTimestamp['gte'] && query.where.messageTimestamp['lte']) {
-        timestampFilter['messageTimestamp'] = {
-          gte: Math.floor(new Date(query.where.messageTimestamp['gte']).getTime() / 1000),
-          lte: Math.floor(new Date(query.where.messageTimestamp['lte']).getTime() / 1000),
-        };
-      }
-    }
+    const queryFilters = this.messageQueryFilters(query?.where);
 
     const count = await this.prismaRepository.message.count({
       where: {
@@ -5032,10 +5024,9 @@ export class BaileysStartupService extends ChannelStartupService {
         id: query?.where?.id,
         source: query?.where?.source,
         messageType: query?.where?.messageType,
-        ...timestampFilter,
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
+          typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } } : {},
           keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
           {
             OR: [
@@ -5043,6 +5034,7 @@ export class BaileysStartupService extends ChannelStartupService {
               keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
             ],
           },
+          ...queryFilters,
         ],
       },
     });
@@ -5061,10 +5053,9 @@ export class BaileysStartupService extends ChannelStartupService {
         id: query?.where?.id,
         source: query?.where?.source,
         messageType: query?.where?.messageType,
-        ...timestampFilter,
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
+          typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } } : {},
           keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
           {
             OR: [
@@ -5072,6 +5063,7 @@ export class BaileysStartupService extends ChannelStartupService {
               keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
             ],
           },
+          ...queryFilters,
         ],
       },
       orderBy: { messageTimestamp: 'desc' },
