@@ -835,6 +835,16 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * Restarts the socket through a single path (POST /instance/restart, see #5): createClient() tears the current
+   * socket down with its handlers detached first, so its close can't also trigger a reconnect, and creation is
+   * serialised, so concurrent restarts/connects end up with one socket.
+   */
+  public async restart(): Promise<void> {
+    this.logger.info('Restarting socket');
+    await this.connectToWhatsapp(this.phoneNumber);
+  }
+
   public async reloadConnection(): Promise<WASocket> {
     try {
       return await this.createClientSerialised(() => this.createClient(this.phoneNumber));
