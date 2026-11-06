@@ -35,5 +35,13 @@ module.exports = {
     '@typescript-eslint/no-wrapper-object-types': 'off',
     '@typescript-eslint/no-unused-expressions': 'off',
     'prettier/prettier': ['error', { endOfLine: 'auto' }],
+    // Every log line must go through Logger (src/config/logger.config.ts) so LOG_LEVEL controls it.
+    'no-console': 'error',
   },
+  overrides: [
+    {
+      files: ['src/config/logger.config.ts'],
+      rules: { 'no-console': 'off' },
+    },
+  ],
 };

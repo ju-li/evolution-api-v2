@@ -356,8 +356,7 @@ export class ChatwootService {
         }
       }
 
-      this.logger.error('Error creating contact');
-      console.log(error);
+      this.logger.error(`Error creating contact: ${error?.message ?? error}`);
       return null;
     }
   }

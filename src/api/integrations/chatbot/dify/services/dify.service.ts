@@ -287,7 +287,7 @@ export class DifyService extends BaseChatbotService<Dify, DifySetting> {
             const event = JSON.parse(eventString);
 
             if (event?.event === 'agent_message') {
-              console.log('event:', event);
+              this.logger.verbose({ message: 'Dify agent event', event });
               conversationId = conversationId ?? event?.conversation_id;
               answer += event?.answer;
             }
