@@ -16,14 +16,14 @@ Built with **Node.js 20+**, **TypeScript 5+**, and **Express.js**, it provides e
 ### Build and Run
 ```bash
 # Development
-npm run dev:server    # Run in development with hot reload (tsx watch)
+npm run dev:server    # Build in watch mode (tsup) and restart the server after each rebuild
 
 # Production
 npm run build        # TypeScript check + tsup build
 npm run start:prod   # Run production build
 
 # Direct execution
-npm start           # Run with tsx
+npm start           # Build once (tsup) and run
 ```
 
 ### Code Quality
