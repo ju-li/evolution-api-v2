@@ -177,6 +177,9 @@ model Message {
   sessionId String?
   session   IntegrationSession? @relation(fields: [sessionId], references: [id])
 
+  // Also unique on ("instanceId", key->>'remoteJid', key->>'id', (key->>'fromMe')::boolean) via the raw-SQL index
+  // "Message_instanceId_key_unique" (migration 20261106120000_message_unique_key). Prisma can't express expression
+  // indexes and ignores it when diffing, so it doesn't appear here.
   @@index([instanceId])
 }
 
