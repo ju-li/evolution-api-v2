@@ -41,6 +41,16 @@ export const whatsappNumberSchema: JSONSchema7 = {
   },
 };
 
+export const lidMappingSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    lids: { type: 'array', maxItems: 200, items: { type: 'string', minLength: 1 } },
+    pns: { type: 'array', maxItems: 200, items: { type: 'string', minLength: 1 } },
+  },
+  anyOf: [{ required: ['lids'] }, { required: ['pns'] }],
+};
+
 export const readMessageSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

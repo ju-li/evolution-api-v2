@@ -26,6 +26,12 @@ export class WhatsAppNumberDto {
   numbers: string[];
 }
 
+/** POST /chat/lidMapping: LIDs and/or phone-number JIDs to resolve (see #12). */
+export class LidMappingDto {
+  lids?: string[];
+  pns?: string[];
+}
+
 export class NumberDto {
   number: string;
 }

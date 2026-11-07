@@ -1,3 +1,4 @@
+import { LidMappingDto } from '@api/dto/chat.dto';
 import { InstanceDto } from '@api/dto/instance.dto';
 import { ProxyDto } from '@api/dto/proxy.dto';
 import { SettingsDto } from '@api/dto/settings.dto';
@@ -771,6 +772,12 @@ export class ChannelStartupService {
       skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
       take: query.offset,
     });
+  }
+
+  /** LID <-> phone-number lookup (see #12). Only Baileys instances keep the mapping; the Baileys service overrides this. */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  public async getLidMapping(data: LidMappingDto): Promise<unknown> {
+    throw new BadRequestException('LID mapping is only available for WhatsApp Baileys instances');
   }
 
   public async findChatByRemoteJid(remoteJid: string) {
