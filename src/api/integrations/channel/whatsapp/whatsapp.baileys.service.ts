@@ -177,6 +177,29 @@ export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000, 60_000,
 export const MAX_RECONNECT_ATTEMPTS = 20;
 export const STABLE_CONNECTION_MS = 60_000;
 
+/**
+ * Whether an inbound edit comes from the author of the stored message it targets (see #25). The lookup already
+ * matched the chat and fromMe, which settles 1:1 chats and our own edits. In groups, the sender (participant, in LID
+ * or PN form) must be one of the original's participant forms.
+ */
+export function isSameAuthor(originalKey: ExtendedIMessageKey, edit: proto.IWebMessageInfo): boolean {
+  const editKey = (edit?.key ?? {}) as ExtendedIMessageKey;
+
+  if (!!originalKey?.fromMe !== !!editKey.fromMe) {
+    return false;
+  }
+  if (editKey.fromMe || !isJidGroup(editKey.remoteJid)) {
+    return true;
+  }
+
+  const forms = (...jids: (string | null | undefined)[]) =>
+    new Set(jids.filter(Boolean).map((jid) => jidNormalizedUser(jid)));
+  const authors = forms(originalKey?.participant, originalKey?.participantAlt);
+  const senders = forms(editKey.participant, editKey.participantAlt, edit?.participant);
+
+  return [...senders].some((jid) => authors.has(jid));
+}
+
 export function reconnectDelayMs(attempt: number, statusCode?: number): number {
   // 515 (restart required) is the normal restart right after pairing: reconnect at once the first time.
   if (attempt === 1 && statusCode === DisconnectReason.restartRequired) {
@@ -1454,44 +1477,24 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
 
           if (editedMessage) {
-            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
+            // Only real edits from the original author (and revokes) touch stored rows (see #25).
+            const outcome = await this.applyInboundProtocolMessage(received, editedMessage);
+
+            if (
+              outcome !== 'rejected' &&
+              this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
+              this.localChatwoot?.enabled
+            )
               this.chatwootService.eventWhatsapp(
                 'messages.edit',
                 { instanceName: this.instance.name, instanceId: this.instance.id },
                 editedMessage,
               );
 
-            await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
-
-            if (received.key?.id && editedMessage.key?.id) {
-              await this.baileysCache.set(`protocol_${received.key.id}`, editedMessage.key.id, 60 * 60 * 24);
-            }
-
-            const oldMessage = await this.getMessage(editedMessage.key, true);
-            if ((oldMessage as any)?.id) {
-              const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
-                ? Math.floor(received?.messageTimestamp.toNumber())
-                : Math.floor(received?.messageTimestamp as number);
-
-              await this.prismaRepository.message.update({
-                where: { id: (oldMessage as any).id },
-                data: {
-                  message: editedMessage.editedMessage as any,
-                  messageTimestamp: editedMessageTimestamp,
-                  status: 'EDITED',
-                },
-              });
-              await this.prismaRepository.messageUpdate.create({
-                data: {
-                  fromMe: editedMessage.key.fromMe,
-                  keyId: editedMessage.key.id,
-                  remoteJid: editedMessage.key.remoteJid,
-                  status: 'EDITED',
-                  instanceId: this.instanceId,
-                  messageId: (oldMessage as any).id,
-                },
-              });
-            }
+            await this.sendDataWebhook(
+              Events.MESSAGES_EDITED,
+              outcome === 'rejected' ? { ...editedMessage, rejected: true } : editedMessage,
+            );
           }
 
           if ((type !== 'notify' && type !== 'append') || editedMessage || !received?.message) {
@@ -5011,6 +5014,103 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.verbose(`Message ${key.id} already stored, skipping duplicate insert`);
       return { message: existing, created: false };
     }
+  }
+
+  /**
+   * Applies an inbound protocol message (edit / revoke) to the stored row it points at (see #25).
+   *
+   * - Only MESSAGE_EDIT changes content, and only when it comes from the original message's author. Anyone who can
+   *   message the account could otherwise craft an "edit" with the id of any stored message and replace its text.
+   * - REVOKE (delete for everyone; also an absent type) marks the row DELETED. It never marks it EDITED, and the
+   *   content is kept. messages.update still sends the delete webhook and writes its MessageUpdate row.
+   * - Any other protocol type (ephemeral settings, ...) leaves stored rows alone.
+   *
+   * The target is looked up in the chat the protocol message arrived in, using the outer key's chat and fromMe. That
+   * is how Baileys resolves it: the inner key is from the sender's perspective.
+   */
+  private async applyInboundProtocolMessage(
+    received: proto.IWebMessageInfo,
+    protocolMsg: proto.Message.IProtocolMessage,
+  ): Promise<'edited' | 'deleted' | 'rejected' | 'not_found' | 'ignored'> {
+    const { MESSAGE_EDIT, REVOKE } = proto.Message.ProtocolMessage.Type;
+    const type = protocolMsg.type ?? REVOKE;
+    const targetId = protocolMsg.key?.id;
+
+    if ((type !== MESSAGE_EDIT && type !== REVOKE) || !targetId || !received?.key) {
+      return 'ignored';
+    }
+
+    const target = await this.findMessageInChat(received.key, targetId);
+    if (!target) {
+      return 'not_found';
+    }
+
+    if (type === MESSAGE_EDIT && !isSameAuthor(target.key as ExtendedIMessageKey, received)) {
+      this.logger.warn(
+        `Rejected edit of message ${targetId}: sender ${JSON.stringify(received.key)} is not the author of ` +
+          `${JSON.stringify(target.key)}`,
+      );
+      return 'rejected';
+    }
+
+    if (received.key.id) {
+      await this.baileysCache.set(`protocol_${received.key.id}`, targetId, 60 * 60 * 24);
+    }
+
+    if (type === REVOKE) {
+      const existingKey = typeof target.key === 'object' && target.key !== null ? target.key : {};
+      await this.prismaRepository.message.update({
+        where: { id: target.id },
+        data: { key: { ...(existingKey as object), deleted: true }, status: 'DELETED' },
+      });
+      return 'deleted';
+    }
+
+    const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
+      ? Math.floor(received.messageTimestamp.toNumber())
+      : Math.floor(received?.messageTimestamp as number);
+
+    await this.prismaRepository.message.update({
+      where: { id: target.id },
+      data: {
+        message: protocolMsg.editedMessage as any,
+        messageTimestamp: editedMessageTimestamp,
+        status: 'EDITED',
+      },
+    });
+    await this.prismaRepository.messageUpdate.create({
+      data: {
+        fromMe: !!received.key.fromMe,
+        keyId: targetId,
+        remoteJid: received.key.remoteJid,
+        status: 'EDITED',
+        instanceId: this.instanceId,
+        messageId: target.id,
+      },
+    });
+
+    return 'edited';
+  }
+
+  /** Finds a stored message by id within one chat (remoteJid or its LID/PN alternate) and the same fromMe. */
+  private async findMessageInChat(chatKey: proto.IMessageKey, id: string): Promise<Message | null> {
+    const chatJids = [chatKey.remoteJid, (chatKey as ExtendedIMessageKey).remoteJidAlt]
+      .filter(Boolean)
+      .map((jid) => jidNormalizedUser(jid));
+    if (chatJids.length === 0) {
+      return null;
+    }
+
+    const rows = (await this.prismaRepository.$queryRaw`
+      SELECT * FROM "Message"
+      WHERE "instanceId" = ${this.instanceId}
+      AND "key"->>'id' = ${id}
+      AND COALESCE(("key"->>'fromMe')::boolean, false) = ${!!chatKey.fromMe}
+      AND ("key"->>'remoteJid' = ANY(${chatJids}::text[]) OR "key"->>'remoteJidAlt' = ANY(${chatJids}::text[]))
+      LIMIT 1
+    `) as Message[];
+
+    return rows[0] ?? null;
   }
 
   private prepareMessage(message: proto.IWebMessageInfo): any {
