@@ -1315,6 +1315,8 @@ export class BaileysStartupService extends ChannelStartupService {
           if (messagesRepository?.has(m.key.id)) {
             continue;
           }
+          // Remember it, so a later batch (or a repeat within this batch) doesn't queue it again.
+          messagesRepository?.add(m.key.id);
 
           if (!m.pushName && !m.key.fromMe) {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
@@ -1637,7 +1639,7 @@ export class BaileysStartupService extends ChannelStartupService {
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { pollUpdates, ...messageData } = messageRaw;
-            const msg = await this.prismaRepository.message.create({ data: messageData });
+            const { message: msg, created } = await this.createMessageOnce(messageData);
 
             const { remoteJid } = received.key;
             const timestamp = msg.messageTimestamp;
@@ -1666,7 +1668,8 @@ export class BaileysStartupService extends ChannelStartupService {
               this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
             }
 
-            if (isMedia) {
+            // A duplicate (already stored, e.g. by history sync) keeps its stored media.
+            if (isMedia && created) {
               if (this.configService.get<S3>('S3').ENABLE) {
                 try {
                   if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
@@ -2754,9 +2757,9 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
-        const msg = await this.prismaRepository.message.create({ data: messageRaw });
+        const { message: msg, created } = await this.createMessageOnce(messageRaw);
 
-        if (isMedia && this.configService.get<S3>('S3').ENABLE) {
+        if (isMedia && created && this.configService.get<S3>('S3').ENABLE) {
           try {
             if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
               throw new Error('Video upload is disabled.');
@@ -4945,6 +4948,38 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return obj;
+  }
+
+  /**
+   * Inserts a message row. "Message" has a unique index on (instanceId, remoteJid, key id, fromMe) (see #9), so a
+   * message that is already stored (history sync racing a live upsert, a redelivery) returns the stored row instead
+   * of failing the whole batch.
+   */
+  private async createMessageOnce(data: any): Promise<{ message: Message; created: boolean }> {
+    try {
+      return { message: await this.prismaRepository.message.create({ data }), created: true };
+    } catch (error) {
+      if (error?.code !== 'P2002') {
+        throw error;
+      }
+
+      const key = (data?.key ?? {}) as { id?: string; remoteJid?: string; fromMe?: boolean };
+      const [existing] = (await this.prismaRepository.$queryRaw`
+        SELECT * FROM "Message"
+        WHERE "instanceId" = ${this.instanceId}
+        AND "key"->>'remoteJid' = ${key.remoteJid}
+        AND "key"->>'id' = ${key.id}
+        AND ("key"->>'fromMe')::boolean = ${!!key.fromMe}
+        LIMIT 1
+      `) as Message[];
+
+      if (!existing) {
+        throw error;
+      }
+
+      this.logger.verbose(`Message ${key.id} already stored, skipping duplicate insert`);
+      return { message: existing, created: false };
+    }
   }
 
   private prepareMessage(message: proto.IWebMessageInfo): any {
