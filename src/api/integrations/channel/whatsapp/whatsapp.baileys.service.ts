@@ -170,6 +170,9 @@ const groupMetadataCache = new CacheService(new CacheEngine(configService, 'grou
  * The attempt counter resets only after the connection has stayed open for STABLE_CONNECTION_MS: in a 440 loop every
  * attempt briefly reaches 'open', so resetting on any open would never run out.
  */
+/** Chat state synced from WhatsApp app state / history (see #1). Only the fields an update carries are set. */
+type ChatState = { archived?: boolean; pinned?: boolean; muteEndTime?: number | null; markedAsUnread?: boolean };
+
 export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
 export const MAX_RECONNECT_ATTEMPTS = 20;
 export const STABLE_CONNECTION_MS = 60_000;
@@ -1047,6 +1050,7 @@ export class BaileysStartupService extends ChannelStartupService {
           instanceId: this.instanceId,
           name: chat.name,
           unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
+          ...this.chatStateFrom(chat),
         }));
 
       this.sendDataWebhook(Events.CHATS_UPSERT, chatsToInsert);
@@ -1064,18 +1068,39 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       >[],
     ) => {
+      // App-state updates are partial: forward and store only the fields each update carries (see #1).
       const chatsRaw = chats.map((chat) => {
-        return { remoteJid: chat.id, instanceId: this.instanceId };
+        const raw: Record<string, unknown> = {
+          remoteJid: chat.id,
+          instanceId: this.instanceId,
+          ...this.chatStateFrom(chat),
+        };
+        if (typeof chat.unreadCount === 'number') {
+          raw.unreadCount = chat.unreadCount;
+        }
+        return raw;
       });
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
 
+      const readOnPhone = new Map<string, number>();
       for (const chat of chats) {
-        await this.prismaRepository.chat.updateMany({
-          where: { instanceId: this.instanceId, remoteJid: chat.id, name: chat.name },
-          data: { remoteJid: chat.id },
-        });
+        const state = this.chatStateFrom(chat);
+        if (Object.keys(state).length > 0) {
+          await this.prismaRepository.chat.updateMany({
+            where: { instanceId: this.instanceId, remoteJid: chat.id },
+            data: state,
+          });
+        }
+
+        // unreadCount 0 = read on the phone (authoritative). Positive values are increments Baileys derives from new
+        // messages, which the status-based recount already covers; -1 = marked as unread (stored as markedAsUnread).
+        if (chat.unreadCount === 0) {
+          readOnPhone.set(chat.id, 0);
+        }
       }
+
+      await this.applyWhatsAppUnreadCounts(readOnPhone);
     },
 
     'chats.delete': async (chats: string[]) => {
@@ -1256,7 +1281,15 @@ export class BaileysStartupService extends ChannelStartupService {
           }
         }
 
-        const chatsRaw: { remoteJid: string; instanceId: string; name?: string }[] = [];
+        const chatsRaw: ({
+          remoteJid: string;
+          instanceId: string;
+          name?: string;
+          unreadMessages: number;
+        } & ChatState)[] = [];
+        const knownChats: { remoteJid: string; state: ChatState }[] = [];
+        // Conversation.unreadCount from history sync is WhatsApp's own count at sync time (see #1).
+        const historyUnreadCounts = new Map<string, number>();
         const chatsRepository = new Set(
           (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
             (chat) => chat.remoteJid,
@@ -1264,17 +1297,30 @@ export class BaileysStartupService extends ChannelStartupService {
         );
 
         for (const chat of chats) {
+          const state = this.chatStateFrom(chat);
+          if (typeof chat.unreadCount === 'number' && chat.unreadCount >= 0) {
+            historyUnreadCounts.set(chat.id, chat.unreadCount);
+          }
+
           if (chatsRepository?.has(chat.id)) {
+            knownChats.push({ remoteJid: chat.id, state });
             continue;
           }
 
-          chatsRaw.push({ remoteJid: chat.id, instanceId: this.instanceId, name: chat.name });
+          chatsRaw.push({
+            remoteJid: chat.id,
+            instanceId: this.instanceId,
+            name: chat.name,
+            unreadMessages: historyUnreadCounts.get(chat.id) ?? 0,
+            ...state,
+          });
         }
 
         this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
           await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
+          await this.refreshChatStates(knownChats);
         }
 
         const messagesRaw: any[] = [];
@@ -1337,6 +1383,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
           await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          await this.applyWhatsAppUnreadCounts(historyUnreadCounts);
         }
 
         if (
@@ -1997,24 +2044,8 @@ export class BaileysStartupService extends ChannelStartupService {
             await this.prismaRepository.messageUpdate.create({ data: messageData });
           }
 
-          const existingChat = await this.prismaRepository.chat.findFirst({
-            where: { instanceId: this.instanceId, remoteJid: message.remoteJid },
-          });
-
-          if (existingChat) {
-            const chatToInsert = { remoteJid: message.remoteJid, instanceId: this.instanceId, unreadMessages: 0 };
-
-            this.sendDataWebhook(Events.CHATS_UPSERT, [chatToInsert]);
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
-              try {
-                await this.prismaRepository.chat.update({ where: { id: existingChat.id }, data: chatToInsert });
-              } catch {
-                this.logger.verbose(
-                  `Chat insert record ignored: ${chatToInsert.remoteJid} - ${chatToInsert.instanceId}`,
-                );
-              }
-            }
-          }
+          // The chat's unread counter is recounted below (readChatToUpdate). It used to be forced to 0 here on ANY
+          // status update in the chat, which reported chats as read that weren't (see #1).
         }
       }
 
@@ -5107,6 +5138,97 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return unreadMessages;
+  }
+  /**
+   * Chat state carried by a Baileys chat update or a history-sync Conversation (see #1). Only fields the update
+   * carries are returned: app-state updates are partial (an archive action has only `archived`, a pin only `pinned`).
+   */
+  private chatStateFrom(chat: Partial<proto.IConversation>): ChatState {
+    const state: ChatState = {};
+
+    if (chat.archived !== undefined && chat.archived !== null) {
+      state.archived = !!chat.archived;
+    }
+    if (chat.pinned !== undefined) {
+      // pin timestamp, or null/0 when unpinned
+      state.pinned = !!chat.pinned;
+    }
+    if (chat.muteEndTime !== undefined) {
+      let end =
+        chat.muteEndTime === null
+          ? 0
+          : Long.isLong(chat.muteEndTime)
+            ? chat.muteEndTime.toNumber()
+            : Number(chat.muteEndTime);
+      if (!Number.isSafeInteger(end) || end < -1) {
+        end = -1; // muted forever (sent as -1 / max uint64)
+      }
+      state.muteEndTime = end ? end : null;
+    }
+    if (chat.markedAsUnread !== undefined && chat.markedAsUnread !== null) {
+      state.markedAsUnread = !!chat.markedAsUnread;
+    }
+    if (chat.unreadCount === -1) {
+      state.markedAsUnread = true;
+    } else if (chat.unreadCount === 0) {
+      state.markedAsUnread = false;
+    }
+
+    return state;
+  }
+
+  /** Writes history-sync state onto chats that already exist, in batched transactions. */
+  private async refreshChatStates(chats: { remoteJid: string; state: ChatState }[]) {
+    const updates = chats.filter((chat) => Object.keys(chat.state).length > 0);
+    for (let i = 0; i < updates.length; i += 200) {
+      await this.prismaRepository.$transaction(
+        updates.slice(i, i + 200).map((chat) =>
+          this.prismaRepository.chat.updateMany({
+            where: { instanceId: this.instanceId, remoteJid: chat.remoteJid },
+            data: chat.state,
+          }),
+        ),
+      );
+    }
+  }
+
+  /**
+   * Applies unread counts that come from WhatsApp itself: 0 when the chat is read on the phone, and
+   * Conversation.unreadCount from history sync (see #1). They're authoritative, so the chat's counter is set to them
+   * and incoming messages still at DELIVERY_ACK beyond the newest N are marked READ. The status-based recount
+   * (updateChatUnreadMessages) then agrees with WhatsApp instead of drifting.
+   */
+  private async applyWhatsAppUnreadCounts(counts: Map<string, number>) {
+    if (!counts || counts.size === 0) {
+      return;
+    }
+
+    const remoteJids = [...counts.keys()];
+    const unread = remoteJids.map((remoteJid) => Math.max(0, counts.get(remoteJid) ?? 0));
+
+    await this.prismaRepository.$executeRaw`
+      UPDATE "Message" AS m
+      SET "status" = ${status[4]}
+      FROM (
+        SELECT
+          msg."id",
+          row_number() OVER (PARTITION BY msg."key"->>'remoteJid' ORDER BY msg."messageTimestamp" DESC) AS rn,
+          t.n
+        FROM "Message" AS msg
+        JOIN unnest(${remoteJids}::text[], ${unread}::int[]) AS t(jid, n) ON msg."key"->>'remoteJid' = t.jid
+        WHERE msg."instanceId" = ${this.instanceId}
+        AND (msg."key"->>'fromMe')::boolean = false
+        AND msg."status" = ${status[3]}
+      ) AS ranked
+      WHERE m."id" = ranked."id" AND ranked.rn > ranked.n
+    `;
+
+    await this.prismaRepository.$executeRaw`
+      UPDATE "Chat" AS c
+      SET "unreadMessages" = t.n
+      FROM unnest(${remoteJids}::text[], ${unread}::int[]) AS t(jid, n)
+      WHERE c."instanceId" = ${this.instanceId} AND c."remoteJid" = t.jid
+    `;
   }
 
   private async addLabel(labelId: string, instanceId: string, chatId: string) {
