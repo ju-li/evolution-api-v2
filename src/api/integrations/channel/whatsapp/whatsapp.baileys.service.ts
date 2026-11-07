@@ -179,6 +179,15 @@ export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000, 60_000,
 export const MAX_RECONNECT_ATTEMPTS = 20;
 export const STABLE_CONNECTION_MS = 60_000;
 
+export function reconnectDelayMs(attempt: number, statusCode?: number): number {
+  // 515 (restart required) is the normal restart right after pairing: reconnect at once the first time.
+  if (attempt === 1 && statusCode === DisconnectReason.restartRequired) {
+    return 0;
+  }
+
+  return RECONNECT_DELAYS_MS[Math.min(Math.max(attempt, 1), RECONNECT_DELAYS_MS.length) - 1];
+}
+
 export const LID_MAPPING_MAX_ENTRIES = 200;
 
 /**
@@ -200,15 +209,6 @@ export function normalizeLidMappingJid(value: string, kind: 'lid' | 'pn'): strin
   }
 
   return (kind === 'lid' ? isLidUser(normalized) : isPnUser(normalized)) ? normalized : null;
-}
-
-export function reconnectDelayMs(attempt: number, statusCode?: number): number {
-  // 515 (restart required) is the normal restart right after pairing: reconnect at once the first time.
-  if (attempt === 1 && statusCode === DisconnectReason.restartRequired) {
-    return 0;
-  }
-
-  return RECONNECT_DELAYS_MS[Math.min(Math.max(attempt, 1), RECONNECT_DELAYS_MS.length) - 1];
 }
 
 // Adicione a função getVideoDuration no início do arquivo
@@ -4802,6 +4802,56 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * Resolves LIDs to phone numbers and phone numbers to LIDs from Baileys' own per-instance mapping
+   * (signalRepository.lidMapping), see #12. Results are keyed by the value the caller sent; unknown entries are null.
+   * Never falls back to IsOnWhatsapp, which is shared by every instance on the server.
+   */
+  public async getLidMapping(data: LidMappingDto) {
+    const lids = Array.isArray(data?.lids) ? data.lids : [];
+    const pns = Array.isArray(data?.pns) ? data.pns : [];
+
+    if (lids.length + pns.length === 0) {
+      throw new BadRequestException('Pass "lids" and/or "pns"');
+    }
+    if (lids.length + pns.length > LID_MAPPING_MAX_ENTRIES) {
+      throw new BadRequestException(`At most ${LID_MAPPING_MAX_ENTRIES} entries per request ("lids" + "pns")`);
+    }
+
+    const lidMapping = this.client?.signalRepository?.lidMapping;
+    if (!lidMapping) {
+      throw new BadRequestException(
+        `Instance "${this.instance.name}" has no WhatsApp session loaded; connect it first`,
+      );
+    }
+    // Unknown phone numbers are looked up on WhatsApp (USync), which needs a live connection. LIDs are local.
+    if (pns.length > 0 && this.stateConnection?.state !== 'open') {
+      throw new BadRequestException(
+        `Instance "${this.instance.name}" is not connected; phone-number lookups need an open connection`,
+      );
+    }
+
+    const lidInputs = lids.map((value) => [value, normalizeLidMappingJid(value, 'lid')] as const);
+    const pnInputs = pns.map((value) => [value, normalizeLidMappingJid(value, 'pn')] as const);
+    const unique = (values: (string | null)[]) => [...new Set(values.filter(Boolean))];
+
+    const lidQueries = unique(lidInputs.map(([, jid]) => jid));
+    const pnQueries = unique(pnInputs.map(([, jid]) => jid));
+
+    const [lidPairs, pnPairs] = await Promise.all([
+      lidQueries.length > 0 ? lidMapping.getPNsForLIDs(lidQueries) : Promise.resolve(null),
+      pnQueries.length > 0 ? lidMapping.getLIDsForPNs(pnQueries) : Promise.resolve(null),
+    ]);
+
+    const pnByLid = new Map((lidPairs ?? []).map((pair) => [jidNormalizedUser(pair.lid), jidNormalizedUser(pair.pn)]));
+    const lidByPn = new Map((pnPairs ?? []).map((pair) => [jidNormalizedUser(pair.pn), jidNormalizedUser(pair.lid)]));
+
+    return {
+      lids: Object.fromEntries(lidInputs.map(([input, jid]) => [input, (jid && pnByLid.get(jid)) || null])),
+      pns: Object.fromEntries(pnInputs.map(([input, jid]) => [input, (jid && lidByPn.get(jid)) || null])),
+    };
+  }
+
   public async fetchAllGroups(getParticipants: GetParticipant) {
     const fetch = Object.values(await this?.client?.groupFetchAllParticipating());
 
@@ -5036,56 +5086,6 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.verbose(`Message ${key.id} already stored, skipping duplicate insert`);
       return { message: existing, created: false };
     }
-  }
-
-  /**
-   * Resolves LIDs to phone numbers and phone numbers to LIDs from Baileys' own per-instance mapping
-   * (signalRepository.lidMapping), see #12. Results are keyed by the value the caller sent; unknown entries are null.
-   * Never falls back to IsOnWhatsapp, which is shared by every instance on the server.
-   */
-  public async getLidMapping(data: LidMappingDto) {
-    const lids = Array.isArray(data?.lids) ? data.lids : [];
-    const pns = Array.isArray(data?.pns) ? data.pns : [];
-
-    if (lids.length + pns.length === 0) {
-      throw new BadRequestException('Pass "lids" and/or "pns"');
-    }
-    if (lids.length + pns.length > LID_MAPPING_MAX_ENTRIES) {
-      throw new BadRequestException(`At most ${LID_MAPPING_MAX_ENTRIES} entries per request ("lids" + "pns")`);
-    }
-
-    const lidMapping = this.client?.signalRepository?.lidMapping;
-    if (!lidMapping) {
-      throw new BadRequestException(
-        `Instance "${this.instance.name}" has no WhatsApp session loaded; connect it first`,
-      );
-    }
-    // Unknown phone numbers are looked up on WhatsApp (USync), which needs a live connection. LIDs are local.
-    if (pns.length > 0 && this.stateConnection?.state !== 'open') {
-      throw new BadRequestException(
-        `Instance "${this.instance.name}" is not connected; phone-number lookups need an open connection`,
-      );
-    }
-
-    const lidInputs = lids.map((value) => [value, normalizeLidMappingJid(value, 'lid')] as const);
-    const pnInputs = pns.map((value) => [value, normalizeLidMappingJid(value, 'pn')] as const);
-    const unique = (values: (string | null)[]) => [...new Set(values.filter(Boolean))];
-
-    const lidQueries = unique(lidInputs.map(([, jid]) => jid));
-    const pnQueries = unique(pnInputs.map(([, jid]) => jid));
-
-    const [lidPairs, pnPairs] = await Promise.all([
-      lidQueries.length > 0 ? lidMapping.getPNsForLIDs(lidQueries) : Promise.resolve(null),
-      pnQueries.length > 0 ? lidMapping.getLIDsForPNs(pnQueries) : Promise.resolve(null),
-    ]);
-
-    const pnByLid = new Map((lidPairs ?? []).map((pair) => [jidNormalizedUser(pair.lid), jidNormalizedUser(pair.pn)]));
-    const lidByPn = new Map((pnPairs ?? []).map((pair) => [jidNormalizedUser(pair.pn), jidNormalizedUser(pair.lid)]));
-
-    return {
-      lids: Object.fromEntries(lidInputs.map(([input, jid]) => [input, (jid && pnByLid.get(jid)) || null])),
-      pns: Object.fromEntries(pnInputs.map(([input, jid]) => [input, (jid && lidByPn.get(jid)) || null])),
-    };
   }
 
   private prepareMessage(message: proto.IWebMessageInfo): any {
