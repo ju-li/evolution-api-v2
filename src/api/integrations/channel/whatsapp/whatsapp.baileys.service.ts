@@ -164,6 +164,25 @@ export interface ExtendedIMessageKey extends proto.IMessageKey {
 
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
 
+/**
+ * Reconnect policy for retryable closes (see #10). Delay before attempt N is RECONNECT_DELAYS_MS[N - 1], and the last
+ * value repeats. After MAX_RECONNECT_ATTEMPTS the instance stops (session kept) instead of looping for hours.
+ * The attempt counter resets only after the connection has stayed open for STABLE_CONNECTION_MS: in a 440 loop every
+ * attempt briefly reaches 'open', so resetting on any open would never run out.
+ */
+export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+export const MAX_RECONNECT_ATTEMPTS = 20;
+export const STABLE_CONNECTION_MS = 60_000;
+
+export function reconnectDelayMs(attempt: number, statusCode?: number): number {
+  // 515 (restart required) is the normal restart right after pairing: reconnect at once the first time.
+  if (attempt === 1 && statusCode === DisconnectReason.restartRequired) {
+    return 0;
+  }
+
+  return RECONNECT_DELAYS_MS[Math.min(Math.max(attempt, 1), RECONNECT_DELAYS_MS.length) - 1];
+}
+
 // Adicione a função getVideoDuration no início do arquivo
 async function getVideoDuration(input: Buffer | string | Readable): Promise<number> {
   const MediaInfoFactory = (await import('mediainfo.js')).default;
@@ -266,6 +285,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private clientCreation: Promise<WASocket> | null = null;
   private voiceCallsSocket?: Promise<{ disconnect: () => unknown }>;
 
+  private reconnectAttempts = 0;
+  private reconnectTimer?: NodeJS.Timeout;
+  private stableConnectionTimer?: NodeJS.Timeout;
+
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
@@ -279,6 +302,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.stopReconnecting();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -449,12 +473,16 @@ export class BaileysStartupService extends ChannelStartupService {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+      this.clearStableConnectionTimer();
+
       if (shouldReconnect) {
         if (generation !== this.clientGeneration) {
           return;
         }
-        await this.connectToWhatsapp(this.phoneNumber);
+        this.scheduleReconnect(statusCode, lastDisconnect);
       } else {
+        this.stopReconnecting();
+
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
@@ -490,6 +518,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      this.startStableConnectionTimer(generation);
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -814,7 +843,15 @@ export class BaileysStartupService extends ChannelStartupService {
     return client;
   }
 
+  /**
+   * Public entry point (API connect, boot auto-connect, restart, Chatwoot): starts a fresh reconnect budget.
+   */
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    this.stopReconnecting();
+    return this.openSocket(number);
+  }
+
+  private async openSocket(number?: string): Promise<WASocket> {
     try {
       return await this.createClientSerialised(async () => {
         this.loadChatwoot();
@@ -843,6 +880,117 @@ export class BaileysStartupService extends ChannelStartupService {
   public async restart(): Promise<void> {
     this.logger.info('Restarting socket');
     await this.connectToWhatsapp(this.phoneNumber);
+  }
+
+  /** Cancels any scheduled reconnect and resets the attempt counter (logout, delete, manual connect). */
+  public stopReconnecting() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    this.clearStableConnectionTimer();
+    this.reconnectAttempts = 0;
+  }
+
+  private clearStableConnectionTimer() {
+    if (this.stableConnectionTimer) {
+      clearTimeout(this.stableConnectionTimer);
+      this.stableConnectionTimer = undefined;
+    }
+  }
+
+  private startStableConnectionTimer(generation: number) {
+    this.clearStableConnectionTimer();
+    this.stableConnectionTimer = setTimeout(() => {
+      this.stableConnectionTimer = undefined;
+      if (generation === this.clientGeneration && this.stateConnection.state === 'open') {
+        if (this.reconnectAttempts > 0) {
+          this.logger.info(`Connection stable for ${STABLE_CONNECTION_MS / 1000}s, reconnect attempts reset`);
+        }
+        this.reconnectAttempts = 0;
+      }
+    }, STABLE_CONNECTION_MS);
+  }
+
+  private scheduleReconnect(statusCode: number | undefined, lastDisconnect?: ConnectionState['lastDisconnect']) {
+    if (this.reconnectTimer) {
+      return;
+    }
+
+    const attempt = this.reconnectAttempts + 1;
+    if (attempt > MAX_RECONNECT_ATTEMPTS) {
+      this.giveUpReconnecting(statusCode, lastDisconnect).catch((error) => this.logger.error(error));
+      return;
+    }
+
+    this.reconnectAttempts = attempt;
+    const delayMs = reconnectDelayMs(attempt, statusCode);
+    this.logger.warn(
+      `Connection closed (status ${statusCode ?? 'none'}), reconnect attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS} in ${delayMs / 1000}s`,
+    );
+
+    const generation = this.clientGeneration;
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = undefined;
+      if (generation !== this.clientGeneration) {
+        // Something else (API connect, restart, logout) already replaced the socket.
+        return;
+      }
+
+      try {
+        await this.openSocket(this.phoneNumber);
+      } catch (error) {
+        // No socket was created, so no close event will follow: schedule the next attempt ourselves.
+        this.logger.error(`Reconnect attempt ${attempt} failed: ${error?.message ?? error}`);
+        this.scheduleReconnect(statusCode, lastDisconnect);
+      }
+    }, delayMs);
+  }
+
+  /**
+   * Retries ran out: stop, but keep the session (no logout.instance, which would wipe it and force a QR scan).
+   * The instance ends `close` with the reason recorded, so monitoring can see it and /instance/connect recovers it.
+   */
+  private async giveUpReconnecting(statusCode: number | undefined, lastDisconnect?: ConnectionState['lastDisconnect']) {
+    this.stopReconnecting();
+    this.teardownClient();
+
+    this.logger.error(
+      `Giving up reconnecting after ${MAX_RECONNECT_ATTEMPTS} attempts (last status ${statusCode ?? 'none'}). ` +
+        'Session kept; call /instance/connect to retry.',
+    );
+
+    this.stateConnection = { state: 'close', statusReason: statusCode };
+    const disconnectionAt = new Date();
+    const disconnectionObject = JSON.stringify(lastDisconnect);
+
+    this.sendDataWebhook(Events.STATUS_INSTANCE, {
+      instance: this.instance.name,
+      status: 'closed',
+      disconnectionAt,
+      disconnectionReasonCode: statusCode,
+      disconnectionObject,
+    });
+
+    await this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: {
+        connectionStatus: 'close',
+        disconnectionAt,
+        disconnectionReasonCode: statusCode,
+        disconnectionObject,
+      },
+    });
+
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      this.chatwootService.eventWhatsapp(
+        Events.STATUS_INSTANCE,
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        { instance: this.instance.name, status: 'closed' },
+      );
+    }
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
   }
 
   public async reloadConnection(): Promise<WASocket> {
