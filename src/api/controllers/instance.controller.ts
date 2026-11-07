@@ -358,6 +358,8 @@ export class InstanceController {
       this.logger.info(`Restarting instance: ${instanceName}`);
 
       if (typeof instance.restart === 'function') {
+        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) instance.clearCacheChatwoot();
+
         await instance.restart();
         // Wait a bit for the reconnection to be established
         await new Promise((r) => setTimeout(r, 2000));
@@ -367,15 +369,6 @@ export class InstanceController {
             status: instance.connectionStatus?.state || 'connecting',
           },
         };
-      }
-
-      // Fallback for Baileys (uses different mechanism)
-      if (state === 'open' || state === 'connecting') {
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) instance.clearCacheChatwoot();
-
-        instance.client?.ws?.close();
-        instance.client?.end(new Error('restart'));
-        return await this.connectToWhatsapp({ instanceName });
       }
 
       return {
