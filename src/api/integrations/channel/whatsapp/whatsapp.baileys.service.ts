@@ -164,6 +164,28 @@ export interface ExtendedIMessageKey extends proto.IMessageKey {
 
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
 
+/**
+ * Reconnect policy for retryable closes (see #10). Delay before attempt N is RECONNECT_DELAYS_MS[N - 1], and the last
+ * value repeats. After MAX_RECONNECT_ATTEMPTS the instance stops (session kept) instead of looping for hours.
+ * The attempt counter resets only after the connection has stayed open for STABLE_CONNECTION_MS: in a 440 loop every
+ * attempt briefly reaches 'open', so resetting on any open would never run out.
+ */
+/** Chat state synced from WhatsApp app state / history (see #1). Only the fields an update carries are set. */
+type ChatState = { archived?: boolean; pinned?: boolean; muteEndTime?: number | null; markedAsUnread?: boolean };
+
+export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+export const MAX_RECONNECT_ATTEMPTS = 20;
+export const STABLE_CONNECTION_MS = 60_000;
+
+export function reconnectDelayMs(attempt: number, statusCode?: number): number {
+  // 515 (restart required) is the normal restart right after pairing: reconnect at once the first time.
+  if (attempt === 1 && statusCode === DisconnectReason.restartRequired) {
+    return 0;
+  }
+
+  return RECONNECT_DELAYS_MS[Math.min(Math.max(attempt, 1), RECONNECT_DELAYS_MS.length) - 1];
+}
+
 // Adicione a função getVideoDuration no início do arquivo
 async function getVideoDuration(input: Buffer | string | Readable): Promise<number> {
   const MediaInfoFactory = (await import('mediainfo.js')).default;
@@ -252,6 +274,24 @@ export class BaileysStartupService extends ChannelStartupService {
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
+  /**
+   * Socket lifecycle guards (see #4).
+   * - clientGeneration increases every time the current socket is torn down or replaced. Event handlers capture the
+   *   generation of the socket they were attached to and ignore events once it is no longer current, so a late
+   *   `close` from a replaced socket can never trigger another reconnect.
+   * - clientEventsUnsubscribe detaches the current socket's ev.process handler.
+   * - clientCreation serialises socket creation: concurrent callers share the in-flight creation instead of
+   *   building a second socket on the same credentials.
+   */
+  private clientGeneration = 0;
+  private clientEventsUnsubscribe?: () => void;
+  private clientCreation: Promise<WASocket> | null = null;
+  private voiceCallsSocket?: Promise<{ disconnect: () => unknown }>;
+
+  private reconnectAttempts = 0;
+  private reconnectTimer?: NodeJS.Timeout;
+  private stableConnectionTimer?: NodeJS.Timeout;
+
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
@@ -265,6 +305,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.stopReconnecting();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -331,7 +372,15 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate(
+    { qr, connection, lastDisconnect }: Partial<ConnectionState>,
+    generation = this.clientGeneration,
+  ) {
+    if (generation !== this.clientGeneration) {
+      // Event from a socket that has already been replaced or torn down.
+      return;
+    }
+
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -427,9 +476,19 @@ export class BaileysStartupService extends ChannelStartupService {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+      this.clearStableConnectionTimer();
+
       if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+        if (generation !== this.clientGeneration) {
+          return;
+        }
+        this.scheduleReconnect(statusCode, lastDisconnect);
+        if (this.reconnectTimer) {
+          await this.reportReconnecting(statusCode, lastDisconnect);
+        }
       } else {
+        this.stopReconnecting();
+
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
@@ -465,6 +524,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      this.startStableConnectionTimer(generation);
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -573,7 +633,68 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * Tears down the current socket so it can never act on this instance again: its event handlers are detached
+   * BEFORE it is ended, so the `close` that `end()` emits cannot reach connectionUpdate and trigger a reconnect.
+   */
+  private teardownClient() {
+    const previous = this.client;
+
+    this.clientGeneration++;
+    this.clientEventsUnsubscribe?.();
+    this.clientEventsUnsubscribe = undefined;
+
+    const voiceCallsSocket = this.voiceCallsSocket;
+    this.voiceCallsSocket = undefined;
+    voiceCallsSocket
+      ?.then((socket) => socket?.disconnect())
+      .catch((error) => this.logger.warn(`Failed to disconnect Wavoip socket: ${error?.message ?? error}`));
+
+    if (!previous) {
+      return;
+    }
+
+    try {
+      previous.ws?.removeAllListeners('CB:call');
+      previous.ws?.removeAllListeners('CB:ack,class:call');
+    } catch {
+      // ignore
+    }
+
+    try {
+      Promise.resolve(previous.end(undefined)).catch((error) =>
+        this.logger.warn(`Error ending replaced socket: ${error?.message ?? error}`),
+      );
+    } catch (error) {
+      this.logger.warn(`Error ending replaced socket: ${error?.message ?? error}`);
+    }
+  }
+
+  /**
+   * Serialises socket creation per instance. While a creation is in flight, every caller (reconnect after a close,
+   * GET /instance/connect, restart, reloadConnection) awaits the same promise instead of creating a second socket.
+   */
+  private createClientSerialised(create: () => Promise<WASocket>): Promise<WASocket> {
+    if (this.clientCreation) {
+      this.logger.verbose('Socket creation already in progress, reusing it');
+      return this.clientCreation;
+    }
+
+    const creation = create().finally(() => {
+      if (this.clientCreation === creation) {
+        this.clientCreation = null;
+      }
+    });
+    this.clientCreation = creation;
+
+    return creation;
+  }
+
   private async createClient(number?: string): Promise<WASocket> {
+    // Never leave the previous socket alive on the same credentials: two sockets on one set of creds replace each
+    // other with 440 (conflict) forever.
+    this.teardownClient();
+
     this.instance.authState = await this.defineAuthState();
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
@@ -695,21 +816,29 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
-    this.client = makeWASocket(socketConfig);
+    const client = makeWASocket(socketConfig);
+    const generation = ++this.clientGeneration;
+    this.client = client;
+
+    // Report 'connecting' right away: until Baileys' first connection.update arrives the state would otherwise still
+    // read 'close', and GET /instance/connect would start yet another socket.
+    this.stateConnection = { state: 'connecting', statusReason: 200 };
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
-      useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any);
+      this.voiceCallsSocket = useVoiceCallsBaileys(this.localSettings.wavoipToken, client, 'connecting');
     }
 
-    this.eventHandler();
+    this.eventHandler(client, generation);
 
-    this.client.ws.on('CB:call', (packet) => {
+    client.ws.on('CB:call', (packet) => {
+      if (generation !== this.clientGeneration) return;
       this.logger.verbose({ event: 'CB:call', packet });
       const payload = { event: 'CB:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
 
-    this.client.ws.on('CB:ack,class:call', (packet) => {
+    client.ws.on('CB:ack,class:call', (packet) => {
+      if (generation !== this.clientGeneration) return;
       this.logger.verbose({ event: 'CB:ack,class:call', packet });
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
@@ -717,31 +846,188 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.phoneNumber = number;
 
-    return this.client;
+    return client;
   }
 
+  /**
+   * Public entry point (API connect, boot auto-connect, restart, Chatwoot): starts a fresh reconnect budget.
+   */
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    this.stopReconnecting();
+    return this.openSocket(number);
+  }
+
+  private async openSocket(number?: string): Promise<WASocket> {
     try {
-      this.loadChatwoot();
-      this.loadSettings();
-      this.loadWebhook();
-      this.loadProxy();
+      return await this.createClientSerialised(async () => {
+        this.loadChatwoot();
+        this.loadSettings();
+        this.loadWebhook();
+        this.loadProxy();
 
-      // Remontar o messageProcessor para garantir que está funcionando após reconexão
-      this.messageProcessor.mount({
-        onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+        // Remontar o messageProcessor para garantir que está funcionando após reconexão
+        this.messageProcessor.mount({
+          onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+        });
+
+        return await this.createClient(number);
       });
-
-      return await this.createClient(number);
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
     }
   }
 
+  /**
+   * Restarts the socket through a single path (POST /instance/restart, see #5): createClient() tears the current
+   * socket down with its handlers detached first, so its close can't also trigger a reconnect, and creation is
+   * serialised, so concurrent restarts/connects end up with one socket.
+   */
+  public async restart(): Promise<void> {
+    this.logger.info('Restarting socket');
+    await this.connectToWhatsapp(this.phoneNumber);
+  }
+
+  /** Cancels any scheduled reconnect and resets the attempt counter (logout, delete, manual connect). */
+  public stopReconnecting() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    this.clearStableConnectionTimer();
+    this.reconnectAttempts = 0;
+  }
+
+  private clearStableConnectionTimer() {
+    if (this.stableConnectionTimer) {
+      clearTimeout(this.stableConnectionTimer);
+      this.stableConnectionTimer = undefined;
+    }
+  }
+
+  private startStableConnectionTimer(generation: number) {
+    this.clearStableConnectionTimer();
+    this.stableConnectionTimer = setTimeout(() => {
+      this.stableConnectionTimer = undefined;
+      if (generation === this.clientGeneration && this.stateConnection.state === 'open') {
+        if (this.reconnectAttempts > 0) {
+          this.logger.info(`Connection stable for ${STABLE_CONNECTION_MS / 1000}s, reconnect attempts reset`);
+        }
+        this.reconnectAttempts = 0;
+      }
+    }, STABLE_CONNECTION_MS);
+  }
+
+  private scheduleReconnect(statusCode: number | undefined, lastDisconnect?: ConnectionState['lastDisconnect']) {
+    if (this.reconnectTimer) {
+      return;
+    }
+
+    const attempt = this.reconnectAttempts + 1;
+    if (attempt > MAX_RECONNECT_ATTEMPTS) {
+      this.giveUpReconnecting(statusCode, lastDisconnect).catch((error) => this.logger.error(error));
+      return;
+    }
+
+    this.reconnectAttempts = attempt;
+    const delayMs = reconnectDelayMs(attempt, statusCode);
+    this.logger.warn(
+      `Connection closed (status ${statusCode ?? 'none'}), reconnect attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS} in ${delayMs / 1000}s`,
+    );
+
+    const generation = this.clientGeneration;
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = undefined;
+      if (generation !== this.clientGeneration) {
+        // Something else (API connect, restart, logout) already replaced the socket.
+        return;
+      }
+
+      try {
+        await this.openSocket(this.phoneNumber);
+      } catch (error) {
+        // No socket was created, so no close event will follow: schedule the next attempt ourselves.
+        this.logger.error(`Reconnect attempt ${attempt} failed: ${error?.message ?? error}`);
+        this.scheduleReconnect(statusCode, lastDisconnect);
+      }
+    }, delayMs);
+  }
+
+  /**
+   * A retryable close is being retried (see #6). Record it so the stored status and webhook consumers don't keep
+   * reporting 'open' over a dead socket: the column, the in-memory state and a connection.update all say
+   * 'connecting', with the disconnection reason. 'connecting' is still auto-connected at boot (monitor setInstance),
+   * so an Evolution restart keeps recovering the instance.
+   */
+  private async reportReconnecting(statusCode: number | undefined, lastDisconnect?: ConnectionState['lastDisconnect']) {
+    this.stateConnection = { state: 'connecting', statusReason: statusCode };
+
+    try {
+      await this.prismaRepository.instance.update({
+        where: { id: this.instanceId },
+        data: {
+          connectionStatus: 'connecting',
+          disconnectionAt: new Date(),
+          disconnectionReasonCode: statusCode,
+          disconnectionObject: JSON.stringify(lastDisconnect),
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Failed to record reconnecting status: ${error?.message ?? error}`);
+    }
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+  }
+
+  /**
+   * Retries ran out: stop, but keep the session (no logout.instance, which would wipe it and force a QR scan).
+   * The instance ends `close` with the reason recorded, so monitoring can see it and /instance/connect recovers it.
+   */
+  private async giveUpReconnecting(statusCode: number | undefined, lastDisconnect?: ConnectionState['lastDisconnect']) {
+    this.stopReconnecting();
+    this.teardownClient();
+
+    this.logger.error(
+      `Giving up reconnecting after ${MAX_RECONNECT_ATTEMPTS} attempts (last status ${statusCode ?? 'none'}). ` +
+        'Session kept; call /instance/connect to retry.',
+    );
+
+    this.stateConnection = { state: 'close', statusReason: statusCode };
+    const disconnectionAt = new Date();
+    const disconnectionObject = JSON.stringify(lastDisconnect);
+
+    this.sendDataWebhook(Events.STATUS_INSTANCE, {
+      instance: this.instance.name,
+      status: 'closed',
+      disconnectionAt,
+      disconnectionReasonCode: statusCode,
+      disconnectionObject,
+    });
+
+    await this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: {
+        connectionStatus: 'close',
+        disconnectionAt,
+        disconnectionReasonCode: statusCode,
+        disconnectionObject,
+      },
+    });
+
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      this.chatwootService.eventWhatsapp(
+        Events.STATUS_INSTANCE,
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        { instance: this.instance.name, status: 'closed' },
+      );
+    }
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+  }
+
   public async reloadConnection(): Promise<WASocket> {
     try {
-      return await this.createClient(this.phoneNumber);
+      return await this.createClientSerialised(() => this.createClient(this.phoneNumber));
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
@@ -764,6 +1050,7 @@ export class BaileysStartupService extends ChannelStartupService {
           instanceId: this.instanceId,
           name: chat.name,
           unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
+          ...this.chatStateFrom(chat),
         }));
 
       this.sendDataWebhook(Events.CHATS_UPSERT, chatsToInsert);
@@ -781,18 +1068,39 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       >[],
     ) => {
+      // App-state updates are partial: forward and store only the fields each update carries (see #1).
       const chatsRaw = chats.map((chat) => {
-        return { remoteJid: chat.id, instanceId: this.instanceId };
+        const raw: Record<string, unknown> = {
+          remoteJid: chat.id,
+          instanceId: this.instanceId,
+          ...this.chatStateFrom(chat),
+        };
+        if (typeof chat.unreadCount === 'number') {
+          raw.unreadCount = chat.unreadCount;
+        }
+        return raw;
       });
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
 
+      const readOnPhone = new Map<string, number>();
       for (const chat of chats) {
-        await this.prismaRepository.chat.updateMany({
-          where: { instanceId: this.instanceId, remoteJid: chat.id, name: chat.name },
-          data: { remoteJid: chat.id },
-        });
+        const state = this.chatStateFrom(chat);
+        if (Object.keys(state).length > 0) {
+          await this.prismaRepository.chat.updateMany({
+            where: { instanceId: this.instanceId, remoteJid: chat.id },
+            data: state,
+          });
+        }
+
+        // unreadCount 0 = read on the phone (authoritative). Positive values are increments Baileys derives from new
+        // messages, which the status-based recount already covers; -1 = marked as unread (stored as markedAsUnread).
+        if (chat.unreadCount === 0) {
+          readOnPhone.set(chat.id, 0);
+        }
       }
+
+      await this.applyWhatsAppUnreadCounts(readOnPhone);
     },
 
     'chats.delete': async (chats: string[]) => {
@@ -973,7 +1281,15 @@ export class BaileysStartupService extends ChannelStartupService {
           }
         }
 
-        const chatsRaw: { remoteJid: string; instanceId: string; name?: string }[] = [];
+        const chatsRaw: ({
+          remoteJid: string;
+          instanceId: string;
+          name?: string;
+          unreadMessages: number;
+        } & ChatState)[] = [];
+        const knownChats: { remoteJid: string; state: ChatState }[] = [];
+        // Conversation.unreadCount from history sync is WhatsApp's own count at sync time (see #1).
+        const historyUnreadCounts = new Map<string, number>();
         const chatsRepository = new Set(
           (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
             (chat) => chat.remoteJid,
@@ -981,17 +1297,30 @@ export class BaileysStartupService extends ChannelStartupService {
         );
 
         for (const chat of chats) {
+          const state = this.chatStateFrom(chat);
+          if (typeof chat.unreadCount === 'number' && chat.unreadCount >= 0) {
+            historyUnreadCounts.set(chat.id, chat.unreadCount);
+          }
+
           if (chatsRepository?.has(chat.id)) {
+            knownChats.push({ remoteJid: chat.id, state });
             continue;
           }
 
-          chatsRaw.push({ remoteJid: chat.id, instanceId: this.instanceId, name: chat.name });
+          chatsRaw.push({
+            remoteJid: chat.id,
+            instanceId: this.instanceId,
+            name: chat.name,
+            unreadMessages: historyUnreadCounts.get(chat.id) ?? 0,
+            ...state,
+          });
         }
 
         this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
           await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
+          await this.refreshChatStates(knownChats);
         }
 
         const messagesRaw: any[] = [];
@@ -1032,6 +1361,8 @@ export class BaileysStartupService extends ChannelStartupService {
           if (messagesRepository?.has(m.key.id)) {
             continue;
           }
+          // Remember it, so a later batch (or a repeat within this batch) doesn't queue it again.
+          messagesRepository?.add(m.key.id);
 
           if (!m.pushName && !m.key.fromMe) {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
@@ -1052,6 +1383,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
           await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          await this.applyWhatsAppUnreadCounts(historyUnreadCounts);
         }
 
         if (
@@ -1354,7 +1686,7 @@ export class BaileysStartupService extends ChannelStartupService {
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { pollUpdates, ...messageData } = messageRaw;
-            const msg = await this.prismaRepository.message.create({ data: messageData });
+            const { message: msg, created } = await this.createMessageOnce(messageData);
 
             const { remoteJid } = received.key;
             const timestamp = msg.messageTimestamp;
@@ -1383,7 +1715,8 @@ export class BaileysStartupService extends ChannelStartupService {
               this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
             }
 
-            if (isMedia) {
+            // A duplicate (already stored, e.g. by history sync) keeps its stored media.
+            if (isMedia && created) {
               if (this.configService.get<S3>('S3').ENABLE) {
                 try {
                   if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
@@ -1711,24 +2044,8 @@ export class BaileysStartupService extends ChannelStartupService {
             await this.prismaRepository.messageUpdate.create({ data: messageData });
           }
 
-          const existingChat = await this.prismaRepository.chat.findFirst({
-            where: { instanceId: this.instanceId, remoteJid: message.remoteJid },
-          });
-
-          if (existingChat) {
-            const chatToInsert = { remoteJid: message.remoteJid, instanceId: this.instanceId, unreadMessages: 0 };
-
-            this.sendDataWebhook(Events.CHATS_UPSERT, [chatToInsert]);
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
-              try {
-                await this.prismaRepository.chat.update({ where: { id: existingChat.id }, data: chatToInsert });
-              } catch {
-                this.logger.verbose(
-                  `Chat insert record ignored: ${chatToInsert.remoteJid} - ${chatToInsert.instanceId}`,
-                );
-              }
-            }
-          }
+          // The chat's unread counter is recounted below (readChatToUpdate). It used to be forced to 0 here on ANY
+          // status update in the chat, which reported chats as read that weren't (see #1).
         }
       }
 
@@ -1878,10 +2195,19 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
-  private eventHandler() {
-    this.client.ev.process(async (events) => {
+  private eventHandler(client: WASocket, generation: number) {
+    this.clientEventsUnsubscribe = client.ev.process(async (events) => {
+      if (generation !== this.clientGeneration) {
+        return;
+      }
+
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
+          // Re-check when dequeued: the socket may have been replaced while earlier events were being processed.
+          if (generation !== this.clientGeneration) {
+            return;
+          }
+
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();
@@ -1906,7 +2232,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
+              this.connectionUpdate(events['connection.update'], generation);
             }
 
             if (events['creds.update']) {
@@ -2462,9 +2788,9 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
-        const msg = await this.prismaRepository.message.create({ data: messageRaw });
+        const { message: msg, created } = await this.createMessageOnce(messageRaw);
 
-        if (isMedia && this.configService.get<S3>('S3').ENABLE) {
+        if (isMedia && created && this.configService.get<S3>('S3').ENABLE) {
           try {
             if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
               throw new Error('Video upload is disabled.');
@@ -4655,6 +4981,38 @@ export class BaileysStartupService extends ChannelStartupService {
     return obj;
   }
 
+  /**
+   * Inserts a message row. "Message" has a unique index on (instanceId, remoteJid, key id, fromMe) (see #9), so a
+   * message that is already stored (history sync racing a live upsert, a redelivery) returns the stored row instead
+   * of failing the whole batch.
+   */
+  private async createMessageOnce(data: any): Promise<{ message: Message; created: boolean }> {
+    try {
+      return { message: await this.prismaRepository.message.create({ data }), created: true };
+    } catch (error) {
+      if (error?.code !== 'P2002') {
+        throw error;
+      }
+
+      const key = (data?.key ?? {}) as { id?: string; remoteJid?: string; fromMe?: boolean };
+      const [existing] = (await this.prismaRepository.$queryRaw`
+        SELECT * FROM "Message"
+        WHERE "instanceId" = ${this.instanceId}
+        AND "key"->>'remoteJid' = ${key.remoteJid}
+        AND "key"->>'id' = ${key.id}
+        AND ("key"->>'fromMe')::boolean = ${!!key.fromMe}
+        LIMIT 1
+      `) as Message[];
+
+      if (!existing) {
+        throw error;
+      }
+
+      this.logger.verbose(`Message ${key.id} already stored, skipping duplicate insert`);
+      return { message: existing, created: false };
+    }
+  }
+
   private prepareMessage(message: proto.IWebMessageInfo): any {
     const contentType = getContentType(message.message);
     const contentMsg = message?.message[contentType] as any;
@@ -4780,6 +5138,97 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return unreadMessages;
+  }
+  /**
+   * Chat state carried by a Baileys chat update or a history-sync Conversation (see #1). Only fields the update
+   * carries are returned: app-state updates are partial (an archive action has only `archived`, a pin only `pinned`).
+   */
+  private chatStateFrom(chat: Partial<proto.IConversation>): ChatState {
+    const state: ChatState = {};
+
+    if (chat.archived !== undefined && chat.archived !== null) {
+      state.archived = !!chat.archived;
+    }
+    if (chat.pinned !== undefined) {
+      // pin timestamp, or null/0 when unpinned
+      state.pinned = !!chat.pinned;
+    }
+    if (chat.muteEndTime !== undefined) {
+      let end =
+        chat.muteEndTime === null
+          ? 0
+          : Long.isLong(chat.muteEndTime)
+            ? chat.muteEndTime.toNumber()
+            : Number(chat.muteEndTime);
+      if (!Number.isSafeInteger(end) || end < -1) {
+        end = -1; // muted forever (sent as -1 / max uint64)
+      }
+      state.muteEndTime = end ? end : null;
+    }
+    if (chat.markedAsUnread !== undefined && chat.markedAsUnread !== null) {
+      state.markedAsUnread = !!chat.markedAsUnread;
+    }
+    if (chat.unreadCount === -1) {
+      state.markedAsUnread = true;
+    } else if (chat.unreadCount === 0) {
+      state.markedAsUnread = false;
+    }
+
+    return state;
+  }
+
+  /** Writes history-sync state onto chats that already exist, in batched transactions. */
+  private async refreshChatStates(chats: { remoteJid: string; state: ChatState }[]) {
+    const updates = chats.filter((chat) => Object.keys(chat.state).length > 0);
+    for (let i = 0; i < updates.length; i += 200) {
+      await this.prismaRepository.$transaction(
+        updates.slice(i, i + 200).map((chat) =>
+          this.prismaRepository.chat.updateMany({
+            where: { instanceId: this.instanceId, remoteJid: chat.remoteJid },
+            data: chat.state,
+          }),
+        ),
+      );
+    }
+  }
+
+  /**
+   * Applies unread counts that come from WhatsApp itself: 0 when the chat is read on the phone, and
+   * Conversation.unreadCount from history sync (see #1). They're authoritative, so the chat's counter is set to them
+   * and incoming messages still at DELIVERY_ACK beyond the newest N are marked READ. The status-based recount
+   * (updateChatUnreadMessages) then agrees with WhatsApp instead of drifting.
+   */
+  private async applyWhatsAppUnreadCounts(counts: Map<string, number>) {
+    if (!counts || counts.size === 0) {
+      return;
+    }
+
+    const remoteJids = [...counts.keys()];
+    const unread = remoteJids.map((remoteJid) => Math.max(0, counts.get(remoteJid) ?? 0));
+
+    await this.prismaRepository.$executeRaw`
+      UPDATE "Message" AS m
+      SET "status" = ${status[4]}
+      FROM (
+        SELECT
+          msg."id",
+          row_number() OVER (PARTITION BY msg."key"->>'remoteJid' ORDER BY msg."messageTimestamp" DESC) AS rn,
+          t.n
+        FROM "Message" AS msg
+        JOIN unnest(${remoteJids}::text[], ${unread}::int[]) AS t(jid, n) ON msg."key"->>'remoteJid' = t.jid
+        WHERE msg."instanceId" = ${this.instanceId}
+        AND (msg."key"->>'fromMe')::boolean = false
+        AND msg."status" = ${status[3]}
+      ) AS ranked
+      WHERE m."id" = ranked."id" AND ranked.rn > ranked.n
+    `;
+
+    await this.prismaRepository.$executeRaw`
+      UPDATE "Chat" AS c
+      SET "unreadMessages" = t.n
+      FROM unnest(${remoteJids}::text[], ${unread}::int[]) AS t(jid, n)
+      WHERE c."instanceId" = ${this.instanceId} AND c."remoteJid" = t.jid
+    `;
   }
 
   private async addLabel(labelId: string, instanceId: string, chatId: string) {

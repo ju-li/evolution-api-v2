@@ -228,9 +228,10 @@ export class ChannelStartupService {
     this.localSettings.syncFullHistory = data?.syncFullHistory;
     this.localSettings.wavoipToken = data?.wavoipToken;
 
-    if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
+    if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0 && this.client?.ws) {
+      // Closing the socket makes the channel reconnect through its normal path, which attaches Wavoip to the new
+      // socket. Re-opening the old ws here (ws.connect()) left an orphaned raw connection behind.
       this.client.ws.close();
-      this.client.ws.connect();
     }
   }
 
@@ -774,12 +775,15 @@ export class ChannelStartupService {
 
   public async findChatByRemoteJid(remoteJid: string) {
     if (!remoteJid) return null;
-    return await this.prismaRepository.chat.findFirst({
+    const chat = await this.prismaRepository.chat.findFirst({
       where: {
         instanceId: this.instanceId,
         remoteJid: remoteJid,
       },
     });
+
+    // muteEndTime is a BigInt column, which JSON can't serialise.
+    return chat ? { ...chat, muteEndTime: chat.muteEndTime === null ? null : Number(chat.muteEndTime) } : chat;
   }
 
   public async fetchChats(query: any) {
@@ -825,6 +829,10 @@ export class ChannelStartupService {
           "Chat"."createdAt" as "windowStart",
           "Chat"."createdAt" + INTERVAL '24 hours' as "windowExpires",
           "Chat"."unreadMessages" as "unreadMessages",
+          "Chat"."archived" as "archived",
+          "Chat"."pinned" as "pinned",
+          "Chat"."muteEndTime" as "muteEndTime",
+          "Chat"."markedAsUnread" as "markedAsUnread",
           CASE WHEN "Chat"."createdAt" + INTERVAL '24 hours' > NOW() THEN true ELSE false END as "windowActive",
           "Message"."id" AS "lastMessageId",
           "Message"."key" AS "lastMessage_key",
@@ -885,6 +893,11 @@ export class ChannelStartupService {
           windowActive: contact.windowActive,
           lastMessage: lastMessage ? this.cleanMessageData(lastMessage) : undefined,
           unreadCount: contact.unreadMessages,
+          archived: contact.archived ?? false,
+          pinned: contact.pinned ?? false,
+          muteEndTime:
+            contact.muteEndTime === null || contact.muteEndTime === undefined ? null : Number(contact.muteEndTime),
+          markedAsUnread: contact.markedAsUnread ?? false,
           isSaved: !!contact.contactId,
         };
       });

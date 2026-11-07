@@ -358,6 +358,8 @@ export class InstanceController {
       this.logger.info(`Restarting instance: ${instanceName}`);
 
       if (typeof instance.restart === 'function') {
+        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) instance.clearCacheChatwoot();
+
         await instance.restart();
         // Wait a bit for the reconnection to be established
         await new Promise((r) => setTimeout(r, 2000));
@@ -367,15 +369,6 @@ export class InstanceController {
             status: instance.connectionStatus?.state || 'connecting',
           },
         };
-      }
-
-      // Fallback for Baileys (uses different mechanism)
-      if (state === 'open' || state === 'connecting') {
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) instance.clearCacheChatwoot();
-
-        instance.client?.ws?.close();
-        instance.client?.end(new Error('restart'));
-        return await this.connectToWhatsapp({ instanceName });
       }
 
       return {
@@ -400,6 +393,26 @@ export class InstanceController {
   }
 
   public async fetchInstances({ instanceName, instanceId, number }: InstanceDto, key: string) {
+    return this.withLiveConnectionStatus(await this.findInstances({ instanceName, instanceId, number }, key));
+  }
+
+  /**
+   * Adds `liveConnectionStatus`, the in-memory socket state, next to the stored `connectionStatus`, so callers don't
+   * need a second request to /instance/connectionState to tell a stored 'open' from a live one.
+   */
+  private withLiveConnectionStatus(instances: any) {
+    const addLive = (instance: any) =>
+      instance && typeof instance === 'object'
+        ? {
+            ...instance,
+            liveConnectionStatus: this.waMonitor.waInstances[instance.name]?.connectionStatus?.state ?? null,
+          }
+        : instance;
+
+    return Array.isArray(instances) ? instances.map(addLive) : addLive(instances);
+  }
+
+  private async findInstances({ instanceName, instanceId, number }: InstanceDto, key: string) {
     const env = this.configService.get<Auth>('AUTHENTICATION').API_KEY;
 
     if (env.KEY !== key) {
