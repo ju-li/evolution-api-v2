@@ -2028,6 +2028,7 @@ export class ChatwootService {
                 path: ['id'],
                 equals: quotedId,
               },
+              instanceId: instance.instanceId,
               chatwootMessageId: {
                 not: null,
               },
