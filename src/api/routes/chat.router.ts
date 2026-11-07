@@ -18,6 +18,7 @@ import {
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Query } from '@api/repository/repository.service';
 import { chatController } from '@api/server.module';
+import { Logger } from '@config/logger.config';
 import { Contact, Message, MessageUpdate } from '@prisma/client';
 import {
   archiveChatSchema,
@@ -41,6 +42,8 @@ import { RequestHandler, Router } from 'express';
 
 import { HttpStatus } from './index.router';
 
+const logger = new Logger('ChatRouter');
+
 export class ChatRouter extends RouterBroker {
   constructor(...guards: RequestHandler[]) {
     super();
@@ -56,7 +59,7 @@ export class ChatRouter extends RouterBroker {
 
           return res.status(HttpStatus.OK).json(response);
         } catch (error) {
-          console.log(error);
+          logger.error(error);
           return res.status(HttpStatus.BAD_REQUEST).json(error);
         }
       })

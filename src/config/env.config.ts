@@ -23,6 +23,31 @@ export type LogBaileys = 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace'
 
 export type LogLevel = 'ERROR' | 'WARN' | 'DEBUG' | 'INFO' | 'LOG' | 'VERBOSE' | 'DARK' | 'WEBHOOKS' | 'WEBSOCKET';
 
+const ALL_LOG_LEVELS: LogLevel[] = [
+  'ERROR',
+  'WARN',
+  'DEBUG',
+  'INFO',
+  'LOG',
+  'VERBOSE',
+  'DARK',
+  'WEBHOOKS',
+  'WEBSOCKET',
+];
+
+/**
+ * Parses LOG_LEVEL (comma-separated). Entries are trimmed and upper-cased, so "ERROR, WARN" keeps WARN.
+ * Unset or empty means every level.
+ */
+export function parseLogLevel(value?: string): LogLevel[] {
+  const levels = (value ?? '')
+    .split(',')
+    .map((level) => level.trim().toUpperCase())
+    .filter(Boolean) as LogLevel[];
+
+  return levels.length > 0 ? levels : [...ALL_LOG_LEVELS];
+}
+
 export type Log = {
   LEVEL: LogLevel[];
   COLOR: boolean;
@@ -731,9 +756,7 @@ export class ConfigService {
         LANGUAGE: process.env.WA_BUSINESS_LANGUAGE || 'en',
       },
       LOG: {
-        LEVEL:
-          (process.env?.LOG_LEVEL?.split(',') as LogLevel[]) ||
-          (['ERROR', 'WARN', 'DEBUG', 'INFO', 'LOG', 'VERBOSE', 'DARK', 'WEBHOOKS', 'WEBSOCKET'] as LogLevel[]),
+        LEVEL: parseLogLevel(process.env?.LOG_LEVEL),
         COLOR: process.env?.LOG_COLOR === 'true',
         BAILEYS: (process.env?.LOG_BAILEYS as LogBaileys) || 'error',
       },
