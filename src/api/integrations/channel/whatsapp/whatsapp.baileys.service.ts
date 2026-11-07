@@ -480,6 +480,9 @@ export class BaileysStartupService extends ChannelStartupService {
           return;
         }
         this.scheduleReconnect(statusCode, lastDisconnect);
+        if (this.reconnectTimer) {
+          await this.reportReconnecting(statusCode, lastDisconnect);
+        }
       } else {
         this.stopReconnecting();
 
@@ -945,6 +948,32 @@ export class BaileysStartupService extends ChannelStartupService {
         this.scheduleReconnect(statusCode, lastDisconnect);
       }
     }, delayMs);
+  }
+
+  /**
+   * A retryable close is being retried (see #6). Record it so the stored status and webhook consumers don't keep
+   * reporting 'open' over a dead socket: the column, the in-memory state and a connection.update all say
+   * 'connecting', with the disconnection reason. 'connecting' is still auto-connected at boot (monitor setInstance),
+   * so an Evolution restart keeps recovering the instance.
+   */
+  private async reportReconnecting(statusCode: number | undefined, lastDisconnect?: ConnectionState['lastDisconnect']) {
+    this.stateConnection = { state: 'connecting', statusReason: statusCode };
+
+    try {
+      await this.prismaRepository.instance.update({
+        where: { id: this.instanceId },
+        data: {
+          connectionStatus: 'connecting',
+          disconnectionAt: new Date(),
+          disconnectionReasonCode: statusCode,
+          disconnectionObject: JSON.stringify(lastDisconnect),
+        },
+      });
+    } catch (error) {
+      this.logger.error(`Failed to record reconnecting status: ${error?.message ?? error}`);
+    }
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
   }
 
   /**
