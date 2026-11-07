@@ -116,17 +116,44 @@ export class WAMonitoringService {
         Sqs: true,
         Websocket: true,
         Setting: true,
-        _count: {
-          select: {
-            Message: true,
-            Contact: true,
-            Chat: true,
-          },
-        },
       },
     });
 
-    return instances;
+    return this.withRecordCounts(instances);
+  }
+
+  /**
+   * Adds `_count: { Message, Contact, Chat }` (same shape as Prisma's `_count` include, which the manager reads) by
+   * counting only the selected instances' rows. Prisma compiles a `_count` include into a GROUP BY "instanceId" over
+   * the whole table, so even fetchInstances?instanceName=x scanned every instance's messages (see #7).
+   */
+  private async withRecordCounts<T extends { id: string }>(instances: T[]) {
+    const ids = instances.map((instance) => instance.id);
+    if (ids.length === 0) {
+      return instances.map((instance) => ({ ...instance, _count: { Message: 0, Contact: 0, Chat: 0 } }));
+    }
+
+    const where = { instanceId: { in: ids } };
+    const [messages, contacts, chats] = await Promise.all([
+      this.prismaRepository.message.groupBy({ by: ['instanceId'], where, _count: { _all: true } }),
+      this.prismaRepository.contact.groupBy({ by: ['instanceId'], where, _count: { _all: true } }),
+      this.prismaRepository.chat.groupBy({ by: ['instanceId'], where, _count: { _all: true } }),
+    ]);
+
+    const byInstance = (rows: { instanceId: string; _count: { _all: number } }[]) =>
+      new Map(rows.map((row) => [row.instanceId, row._count._all]));
+    const messageCounts = byInstance(messages);
+    const contactCounts = byInstance(contacts);
+    const chatCounts = byInstance(chats);
+
+    return instances.map((instance) => ({
+      ...instance,
+      _count: {
+        Message: messageCounts.get(instance.id) ?? 0,
+        Contact: contactCounts.get(instance.id) ?? 0,
+        Chat: chatCounts.get(instance.id) ?? 0,
+      },
+    }));
   }
 
   public async instanceInfoById(instanceId?: string, number?: string) {
