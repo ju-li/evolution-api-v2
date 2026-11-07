@@ -193,9 +193,10 @@ export class ChannelStartupService {
     this.localSettings.syncFullHistory = data?.syncFullHistory;
     this.localSettings.wavoipToken = data?.wavoipToken;
 
-    if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
+    if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0 && this.client?.ws) {
+      // Closing the socket makes the channel reconnect through its normal path, which attaches Wavoip to the new
+      // socket. Re-opening the old ws here (ws.connect()) left an orphaned raw connection behind.
       this.client.ws.close();
-      this.client.ws.connect();
     }
   }
 
