@@ -1406,7 +1406,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
           await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
-          await this.applyWhatsAppUnreadCounts(historyUnreadCounts);
+          await this.applyWhatsAppUnreadCounts(await this.historyUnreadTargets(historyUnreadCounts, messagesRaw));
         }
 
         if (
@@ -5275,6 +5275,37 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return state;
+  }
+
+  /**
+   * Unread counts to apply after a history batch (see #24). History messages arrive without a status and are stored
+   * as DELIVERY_ACK (unread), so every chat the batch inserted incoming messages for must be aligned with WhatsApp's
+   * own count: the batch's Conversation.unreadCount when present, else the chat's stored counter (from an earlier
+   * batch), else 0. Without this, imported chats counted thousands of unread messages and every new message recounted
+   * all of them.
+   */
+  private async historyUnreadTargets(batchCounts: Map<string, number>, messages: { key?: any }[]) {
+    const counts = new Map(batchCounts);
+    const missing = [
+      ...new Set(
+        messages
+          .filter((message) => message?.key?.remoteJid && !message.key.fromMe)
+          .map((message) => message.key.remoteJid as string),
+      ),
+    ].filter((remoteJid) => !counts.has(remoteJid));
+
+    if (missing.length > 0) {
+      const stored = await this.prismaRepository.chat.findMany({
+        where: { instanceId: this.instanceId, remoteJid: { in: missing } },
+        select: { remoteJid: true, unreadMessages: true },
+      });
+      const storedCounts = new Map(stored.map((chat) => [chat.remoteJid, chat.unreadMessages]));
+      for (const remoteJid of missing) {
+        counts.set(remoteJid, storedCounts.get(remoteJid) ?? 0);
+      }
+    }
+
+    return counts;
   }
 
   /** Writes history-sync state onto chats that already exist, in batched transactions. */
