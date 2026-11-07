@@ -11,7 +11,7 @@ import { eventManager, waMonitor } from '@api/server.module';
 import { Events, wa } from '@api/types/wa.types';
 import { Auth, Chatwoot, ConfigService, HttpServer, Proxy } from '@config/env.config';
 import { Logger } from '@config/logger.config';
-import { NotFoundException } from '@exceptions';
+import { BadRequestException, NotFoundException } from '@exceptions';
 import { Contact, Message, Prisma } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { WASocket } from 'baileys';
@@ -20,6 +20,41 @@ import EventEmitter2 from 'eventemitter2';
 import { v4 } from 'uuid';
 
 import { CacheService } from './cache.service';
+
+/**
+ * Text-bearing paths inside "Message".message, searched by findMessages' where.message (see #8). Listed explicitly
+ * rather than searched recursively, which would also match quoted text in contextInfo.quotedMessage.
+ */
+const MESSAGE_TEXT_PATHS: string[][] = [
+  ['conversation'],
+  ['extendedTextMessage', 'text'],
+  ['imageMessage', 'caption'],
+  ['videoMessage', 'caption'],
+  ['ptvMessage', 'caption'],
+  ['documentMessage', 'caption'],
+  ['documentWithCaptionMessage', 'message', 'documentMessage', 'caption'],
+  ['buttonsResponseMessage', 'selectedDisplayText'],
+  ['listResponseMessage', 'title'],
+  ['templateButtonReplyMessage', 'selectedDisplayText'],
+  ['pollCreationMessage', 'name'],
+  ['pollCreationMessageV3', 'name'],
+  ['eventMessage', 'name'],
+];
+
+function collectSearchTerms(value: unknown, terms: string[] = []): string[] {
+  if (typeof value === 'string') {
+    if (value.trim().length > 0) terms.push(value);
+  } else if (Array.isArray(value)) {
+    value.forEach((item) => collectSearchTerms(item, terms));
+  } else if (value && typeof value === 'object') {
+    Object.values(value).forEach((item) => collectSearchTerms(item, terms));
+  }
+  return terms;
+}
+
+function hasValue(value: unknown) {
+  return value !== undefined && value !== null && value !== '';
+}
 
 export class ChannelStartupService {
   constructor(
@@ -597,6 +632,45 @@ export class ChannelStartupService {
     return cleanedMessage;
   }
 
+  /**
+   * Filters shared by both fetchMessages implementations (see #8):
+   * - where.messageTimestamp: gte and lte apply independently (a one-sided range used to be silently ignored).
+   * - where.message: text search. Every string in it must appear (case-insensitive) in one of MESSAGE_TEXT_PATHS, so
+   *   { conversation: "hello" } finds "hello" whether it was sent as text or as a caption. It used to be ignored,
+   *   returning an unfiltered page that looked like a result set.
+   */
+  protected messageQueryFilters(where: any): Prisma.MessageWhereInput[] {
+    const filters: Prisma.MessageWhereInput[] = [];
+    const toEpochSeconds = (value: unknown) => Math.floor(new Date(value as any).getTime() / 1000);
+
+    const timestamp = where?.messageTimestamp;
+    if (hasValue(timestamp?.gte)) {
+      filters.push({ messageTimestamp: { gte: toEpochSeconds(timestamp.gte) } });
+    }
+    if (hasValue(timestamp?.lte)) {
+      filters.push({ messageTimestamp: { lte: toEpochSeconds(timestamp.lte) } });
+    }
+
+    const message = where?.message;
+    const isEmptyObject = message && typeof message === 'object' && Object.keys(message).length === 0;
+    if (hasValue(message) && !isEmptyObject) {
+      const terms = collectSearchTerms(message);
+      if (terms.length === 0) {
+        throw new BadRequestException(
+          'where.message only supports text search: pass the text to find, e.g. { "conversation": "hello" }',
+        );
+      }
+
+      for (const term of terms) {
+        filters.push({
+          OR: MESSAGE_TEXT_PATHS.map((path) => ({ message: { path, string_contains: term, mode: 'insensitive' } })),
+        });
+      }
+    }
+
+    return filters;
+  }
+
   public async fetchMessages(query: Query<Message>) {
     const keyFilters = query?.where?.key as {
       id?: string;
@@ -605,15 +679,7 @@ export class ChannelStartupService {
       participants?: string;
     };
 
-    const timestampFilter = {};
-    if (query?.where?.messageTimestamp) {
-      if (query.where.messageTimestamp['gte'] && query.where.messageTimestamp['lte']) {
-        timestampFilter['messageTimestamp'] = {
-          gte: Math.floor(new Date(query.where.messageTimestamp['gte']).getTime() / 1000),
-          lte: Math.floor(new Date(query.where.messageTimestamp['lte']).getTime() / 1000),
-        };
-      }
-    }
+    const queryFilters = this.messageQueryFilters(query?.where);
 
     const count = await this.prismaRepository.message.count({
       where: {
@@ -621,12 +687,12 @@ export class ChannelStartupService {
         id: query?.where?.id,
         source: query?.where?.source,
         messageType: query?.where?.messageType,
-        ...timestampFilter,
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
+          typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } } : {},
           keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
           keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+          ...queryFilters,
         ],
       },
     });
@@ -645,12 +711,12 @@ export class ChannelStartupService {
         id: query?.where?.id,
         source: query?.where?.source,
         messageType: query?.where?.messageType,
-        ...timestampFilter,
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
+          typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } } : {},
           keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
           keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+          ...queryFilters,
         ],
       },
       orderBy: {
