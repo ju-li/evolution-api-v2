@@ -3,6 +3,7 @@ import {
   BlockUserDto,
   DeleteMessage,
   getBase64FromMediaMessageDto,
+  LidMappingDto,
   MarkChatUnreadDto,
   NumberDto,
   PrivacySettingDto,
@@ -21,6 +22,10 @@ import { Contact, Message, MessageUpdate } from '@prisma/client';
 
 export class ChatController {
   constructor(private readonly waMonitor: WAMonitoringService) {}
+
+  public async lidMapping({ instanceName }: InstanceDto, data: LidMappingDto) {
+    return await this.waMonitor.waInstances[instanceName].getLidMapping(data);
+  }
 
   public async whatsappNumber({ instanceName }: InstanceDto, data: WhatsAppNumberDto) {
     return await this.waMonitor.waInstances[instanceName].whatsappNumber(data);

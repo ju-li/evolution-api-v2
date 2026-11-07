@@ -4,6 +4,7 @@ import {
   BlockUserDto,
   DeleteMessage,
   getBase64FromMediaMessageDto,
+  LidMappingDto,
   MarkChatUnreadDto,
   NumberDto,
   PrivacySettingDto,
@@ -25,6 +26,7 @@ import {
   blockUserSchema,
   contactValidateSchema,
   deleteMessageSchema,
+  lidMappingSchema,
   markChatUnreadSchema,
   messageUpSchema,
   messageValidateSchema,
@@ -48,6 +50,21 @@ export class ChatRouter extends RouterBroker {
   constructor(...guards: RequestHandler[]) {
     super();
     this.router
+      .post(this.routerPath('lidMapping'), ...guards, async (req, res) => {
+        try {
+          const response = await this.dataValidate<LidMappingDto>({
+            request: req,
+            schema: lidMappingSchema,
+            ClassRef: LidMappingDto,
+            execute: (instance, data) => chatController.lidMapping(instance, data),
+          });
+
+          return res.status(HttpStatus.OK).json(response);
+        } catch (error) {
+          logger.error(error);
+          return res.status(HttpStatus.BAD_REQUEST).json(error);
+        }
+      })
       .post(this.routerPath('whatsappNumbers'), ...guards, async (req, res) => {
         try {
           const response = await this.dataValidate<WhatsAppNumberDto>({
