@@ -101,18 +101,31 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
 
       const expandedJids = baseJids.flatMap((jid) => getAvailableNumbers(jid));
 
-      // 1. Busca entrada por jidOptions e também remoteJid
-      // Às vezes acontece do remoteJid atual NÃO ESTAR no jidOptions ainda, ocasionando o erro:
-      // 'Unique constraint failed on the fields: (`remoteJid`)'
-      // Isso acontece principalmente em grupos que possuem o número do criador no ID (ex.: '559911223345-1234567890@g.us')
-      const existingRecord = await prismaRepository.isOnWhatsapp.findFirst({
-        where: {
-          OR: [
-            ...expandedJids.map((jid) => ({ jidOptions: { contains: jid } })),
-            { remoteJid: remoteJid }, // TODO: Descobrir o motivo que causa o remoteJid não estar (às vezes) incluso na lista de jidOptions
-          ],
-        },
+      // 1. Busca a entrada existente.
+      // 1a. Primeiro pelo JID exato, usando o índice único de "remoteJid" (sem seq scan).
+      //     Inclui as variantes (9º dígito BR, MX/AR) e o LID alternativo, para achar o registro
+      //     mesmo quando ele foi salvo sob a outra forma.
+      //     Às vezes o remoteJid atual NÃO ESTÁ no jidOptions, o que causaria
+      //     'Unique constraint failed on the fields: (`remoteJid`)' no create.
+      //     Isso acontece principalmente em grupos que possuem o número do criador no ID
+      //     (ex.: '559911223345-1234567890@g.us').
+      const exactMatches = await prismaRepository.isOnWhatsapp.findMany({
+        where: { remoteJid: { in: [...new Set([remoteJid, ...expandedJids])] } },
       });
+      // Prefere o registro cujo remoteJid é exatamente o atual: atualizar outro registro para
+      // esse remoteJid violaria a constraint única.
+      let existingRecord = exactMatches.find((record) => record.remoteJid === remoteJid) ?? exactMatches[0] ?? null;
+
+      // 1b. Só se não achou pelo JID exato, cai na busca por substring em jidOptions
+      //     (LIKE '%…%', faz seq scan). Mesma consulta de antes, sem o ramo de remoteJid,
+      //     que já foi coberto acima.
+      if (!existingRecord) {
+        existingRecord = await prismaRepository.isOnWhatsapp.findFirst({
+          where: {
+            OR: expandedJids.map((jid) => ({ jidOptions: { contains: jid } })),
+          },
+        });
+      }
 
       logger.verbose(
         `[saveOnWhatsappCache] Register exists for [${expandedJids.join(',')}]? => ${existingRecord ? existingRecord.remoteJid : 'Not found'}`,
