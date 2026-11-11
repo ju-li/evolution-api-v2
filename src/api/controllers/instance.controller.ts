@@ -400,16 +400,11 @@ export class InstanceController {
    * Adds `liveConnectionStatus`, the in-memory socket state, next to the stored `connectionStatus`, so callers don't
    * need a second request to /instance/connectionState to tell a stored 'open' from a live one.
    */
-  private withLiveConnectionStatus(instances: any) {
-    const addLive = (instance: any) =>
-      instance && typeof instance === 'object'
-        ? {
-            ...instance,
-            liveConnectionStatus: this.waMonitor.waInstances[instance.name]?.connectionStatus?.state ?? null,
-          }
-        : instance;
-
-    return Array.isArray(instances) ? instances.map(addLive) : addLive(instances);
+  private withLiveConnectionStatus(instances: any[]) {
+    return instances.map((instance) => ({
+      ...instance,
+      liveConnectionStatus: this.waMonitor.waInstances[instance.name]?.connectionStatus?.state ?? null,
+    }));
   }
 
   private async findInstances({ instanceName, instanceId, number }: InstanceDto, key: string) {

@@ -1,7 +1,7 @@
 import { prismaRepository } from '@api/server.module';
 import { configService, Database } from '@config/env.config';
 import { Logger } from '@config/logger.config';
-import { IsOnWhatsapp } from '@prisma/client';
+import { IsOnWhatsapp, Prisma } from '@prisma/client';
 import dayjs from 'dayjs';
 
 const logger = new Logger('OnWhatsappCache');
@@ -91,6 +91,14 @@ function isPostgres(): boolean {
   return ['postgresql', 'psql_bouncer'].includes(configService.get<Database>('DATABASE').PROVIDER);
 }
 
+/** PostgreSQL: rows whose jidOptions list any of `jids`. Keep the predicate exactly as is, see above. */
+function selectByJidOptions(jids: string[]): Prisma.Sql {
+  return Prisma.sql`
+    SELECT "id", "remoteJid", "jidOptions", "lid", "createdAt", "updatedAt"
+    FROM "IsOnWhatsapp"
+    WHERE string_to_array("jidOptions", ',') && ${jids}::text[]`;
+}
+
 function hasJidOption(record: Pick<IsOnWhatsapp, 'jidOptions'>, jids: Set<string>): boolean {
   return record.jidOptions.split(',').some((jid) => jids.has(jid));
 }
@@ -108,9 +116,7 @@ async function findRecordToMerge(remoteJid: string, jids: string[]): Promise<IsO
     // No LIMIT 1: the planner guesses hundreds of matches for `&&` and, under a LIMIT, bets on a sequential scan that
     // stops early. Without it both branches use their index (BitmapOr). A number matches a row or two.
     matches = await prismaRepository.$queryRaw<IsOnWhatsapp[]>`
-      SELECT "id", "remoteJid", "jidOptions", "lid", "createdAt", "updatedAt"
-      FROM "IsOnWhatsapp"
-      WHERE string_to_array("jidOptions", ',') && ${jids}::text[]
+      ${selectByJidOptions(jids)}
          OR "remoteJid" = ANY(${jids}::text[])
     `;
   } else {
@@ -138,9 +144,7 @@ async function findCachedRecords(jids: string[], since: Date): Promise<IsOnWhats
     // "updatedAt" is a timestamp without time zone holding UTC (Prisma writes it so). Casting the ISO string drops
     // its 'Z' and compares UTC to UTC whatever the session time zone is.
     return prismaRepository.$queryRaw<IsOnWhatsapp[]>`
-      SELECT "id", "remoteJid", "jidOptions", "lid", "createdAt", "updatedAt"
-      FROM "IsOnWhatsapp"
-      WHERE string_to_array("jidOptions", ',') && ${jids}::text[]
+      ${selectByJidOptions(jids)}
         AND "updatedAt" >= ${since.toISOString()}::timestamp
     `;
   }
