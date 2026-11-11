@@ -3,11 +3,12 @@ import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/d
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { chatwootWebhookUrl } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-webhook-token';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { Events } from '@api/types/wa.types';
-import { Chatwoot, ConfigService, Database, HttpServer } from '@config/env.config';
+import { Chatwoot, ConfigService, Database } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import ChatwootClient, {
   ChatwootAPIConfig,
@@ -115,12 +116,11 @@ export class ChatwootService {
 
     if (data.autoCreate) {
       this.logger.log('Auto create chatwoot instance');
-      const urlServer = this.configService.get<HttpServer>('SERVER').URL;
 
       await this.initInstanceChatwoot(
         instance,
         data.nameInbox ?? instance.instanceName.split('-cwId-')[0],
-        `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,
+        chatwootWebhookUrl(instance.instanceName),
         true,
         data.number,
         data.organization,
@@ -1190,6 +1190,14 @@ export class ChatwootService {
     }
   }
 
+  private isChatwootOrigin(mediaUrl: unknown): boolean {
+    try {
+      return typeof mediaUrl === 'string' && new URL(mediaUrl).origin === new URL(this.provider.url).origin;
+    } catch {
+      return false;
+    }
+  }
+
   public async sendAttachment(waInstance: any, number: string, media: any, caption?: string, options?: Options) {
     try {
       const parsedMedia = path.parse(decodeURIComponent(media));
@@ -1466,6 +1474,11 @@ export class ChatwootService {
         for (const message of body.conversation.messages) {
           if (message.attachments && message.attachments.length > 0) {
             for (const attachment of message.attachments) {
+              if (!this.isChatwootOrigin(attachment.data_url)) {
+                this.logger.warn('Ignoring attachment outside the configured Chatwoot origin');
+                continue;
+              }
+
               if (!messageReceived) {
                 formatText = null;
               }

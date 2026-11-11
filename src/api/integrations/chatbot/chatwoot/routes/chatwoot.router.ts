@@ -1,6 +1,7 @@
 import { RouterBroker } from '@api/abstract/abstract.router';
 import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
+import { chatwootWebhookTokenGuard } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-webhook-token';
 import { HttpStatus } from '@api/routes/index.router';
 import { chatwootController } from '@api/server.module';
 import { chatwootSchema, instanceSchema } from '@validate/validate.schema';
@@ -30,7 +31,7 @@ export class ChatwootRouter extends RouterBroker {
 
         res.status(HttpStatus.OK).json(response);
       })
-      .post(this.routerPath('webhook'), async (req, res) => {
+      .post(this.routerPath('webhook'), chatwootWebhookTokenGuard, async (req, res) => {
         const response = await this.dataValidate<InstanceDto>({
           request: req,
           schema: instanceSchema,
