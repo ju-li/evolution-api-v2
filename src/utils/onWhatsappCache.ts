@@ -51,8 +51,10 @@ function getAvailableNumbers(remoteJid: string) {
   }
 
   // Other countries
+  // Push the bare number: the domain is appended below. Pushing remoteJid stored and searched for
+  // '…@s.whatsapp.net@s.whatsapp.net', which no caller ever matched, so the cache never hit (see #30).
   else {
-    numbersAvailable.push(remoteJid);
+    numbersAvailable.push(number);
   }
 
   // TODO: Adiciona @domain apenas para números que não são @lid
