@@ -5,7 +5,7 @@
 -- asks `string_to_array("jidOptions", ',') && $1::text[]`; this GIN index serves exactly that expression. A query
 -- must spell the expression the same way, or the planner won't use the index.
 --
--- Depends on 20261111120000_is_on_whatsapp_single_domain: exact matching only finds entries spelled like the JIDs
+-- Depends on 20261111120000_is_on_whatsapp_fix_doubled_domain: exact matching only finds entries spelled like the JIDs
 -- searched for. Prisma can't express an expression index, so it lives only in SQL; see the note on model IsOnWhatsapp.
 CREATE INDEX "IsOnWhatsapp_jidOptions_elements_idx"
   ON "IsOnWhatsapp" USING gin (string_to_array("jidOptions", ','));

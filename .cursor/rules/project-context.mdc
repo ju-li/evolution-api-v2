@@ -119,7 +119,7 @@ alwaysApply: true
 ## Development Constraints
 
 ### Language Requirements
-- **USER COMMUNICATION**: Always respond in Portuguese (PT-BR)
+- **USER COMMUNICATION**: Always respond in English
 - **CODE/COMMENTS**: English for code and technical documentation
 - **API RESPONSES**: English for consistency
 - **ERROR MESSAGES**: Portuguese for user-facing errors
