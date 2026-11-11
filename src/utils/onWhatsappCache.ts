@@ -97,7 +97,8 @@ function hasJidOption(record: Pick<IsOnWhatsapp, 'jidOptions'>, jids: Set<string
 
 /**
  * The row to merge `remoteJid` into: one listing any of `jids` (its spellings, `remoteJid` included), or stored under
- * one of them as its remoteJid. When several match, `remoteJid`'s own row wins.
+ * one of them as its remoteJid. Replaces #31's two-step lookup (exact remoteJid, then a LIKE scan): the GIN index on
+ * jidOptions and the unique index on remoteJid serve both branches of one query.
  */
 async function findRecordToMerge(remoteJid: string, jids: string[]): Promise<IsOnWhatsapp | null> {
   const wanted = new Set(jids);
@@ -121,7 +122,14 @@ async function findRecordToMerge(remoteJid: string, jids: string[]): Promise<IsO
     matches = candidates.filter((record) => wanted.has(record.remoteJid) || hasJidOption(record, wanted));
   }
 
-  return matches.find((record) => record.remoteJid === remoteJid) ?? matches[0] ?? null;
+  // Prefer remoteJid's own row (updating another row to this remoteJid would violate its unique constraint), then a
+  // row stored under one of its other spellings, then one that only lists it in jidOptions.
+  return (
+    matches.find((record) => record.remoteJid === remoteJid) ??
+    matches.find((record) => wanted.has(record.remoteJid)) ??
+    matches[0] ??
+    null
+  );
 }
 
 /** Rows listing any of `jids`, saved at or after `since`. */
@@ -171,10 +179,13 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
 
       const expandedJids = baseJids.flatMap((jid) => getAvailableNumbers(jid));
 
-      // 1. Busca entrada por jidOptions e também remoteJid
-      // Às vezes acontece do remoteJid atual NÃO ESTAR no jidOptions ainda, ocasionando o erro:
-      // 'Unique constraint failed on the fields: (`remoteJid`)'
-      // Isso acontece principalmente em grupos que possuem o número do criador no ID (ex.: '559911223345-1234567890@g.us')
+      // 1. Busca a entrada existente, numa só consulta indexada (ver findRecordToMerge e #32):
+      //    pelas entradas exatas de jidOptions, ou pelo remoteJid. Inclui as variantes (9º dígito BR, MX/AR) e o
+      //    LID alternativo, para achar o registro mesmo quando ele foi salvo sob a outra forma.
+      //    Às vezes o remoteJid atual NÃO ESTÁ no jidOptions, o que causaria
+      //    'Unique constraint failed on the fields: (`remoteJid`)' no create.
+      //    Isso acontece principalmente em grupos que possuem o número do criador no ID
+      //    (ex.: '559911223345-1234567890@g.us').
       // TODO: Descobrir o motivo que causa o remoteJid não estar (às vezes) incluso na lista de jidOptions
       const existingRecord = await findRecordToMerge(remoteJid, [...new Set([...expandedJids, remoteJid])]);
 
