@@ -1,7 +1,8 @@
 import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
-import { Chatwoot, ConfigService, HttpServer } from '@config/env.config';
+import { chatwootWebhookUrl } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-webhook-token';
+import { Chatwoot, ConfigService } from '@config/env.config';
 import { BadRequestException } from '@exceptions';
 import { isURL } from 'class-validator';
 
@@ -39,11 +40,9 @@ export class ChatwootController {
 
     const result = await this.chatwootService.create(instance, data);
 
-    const urlServer = this.configService.get<HttpServer>('SERVER').URL;
-
     const response = {
       ...result,
-      webhook_url: `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,
+      webhook_url: chatwootWebhookUrl(instance.instanceName),
     };
 
     return response;
@@ -53,8 +52,6 @@ export class ChatwootController {
     if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
 
     const result = await this.chatwootService.find(instance);
-
-    const urlServer = this.configService.get<HttpServer>('SERVER').URL;
 
     if (Object.keys(result || {}).length === 0) {
       return {
@@ -70,7 +67,7 @@ export class ChatwootController {
 
     const response = {
       ...result,
-      webhook_url: `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,
+      webhook_url: chatwootWebhookUrl(instance.instanceName),
     };
 
     return response;

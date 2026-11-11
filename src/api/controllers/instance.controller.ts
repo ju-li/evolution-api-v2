@@ -1,5 +1,6 @@
 import { InstanceDto, SetPresenceDto } from '@api/dto/instance.dto';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { chatwootWebhookUrl } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-webhook-token';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { channelController, eventManager } from '@api/server.module';
@@ -225,8 +226,6 @@ export class InstanceController {
         throw new BadRequestException('conversationPending is required');
       }
 
-      const urlServer = this.configService.get<HttpServer>('SERVER').URL;
-
       try {
         this.chatwootService.create(instanceDto, {
           enabled: true,
@@ -296,7 +295,7 @@ export class InstanceController {
           daysLimitImportMessages: instanceData.chatwootDaysLimitImportMessages || 60,
           number: instanceData.number,
           nameInbox: instanceData.chatwootNameInbox ?? instance.instanceName,
-          webhookUrl: `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,
+          webhookUrl: chatwootWebhookUrl(instance.instanceName),
         },
       };
     } catch (error) {
