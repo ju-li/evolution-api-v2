@@ -86,6 +86,7 @@ import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
+import { safeFetchMedia, SafeFetchMediaResult, UnsafeMediaUrlError } from '@utils/safeFetchMedia';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
 import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-files';
@@ -749,8 +750,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (this.localProxy?.host?.includes('proxyscrape')) {
         try {
-          const response = await axios.get(this.localProxy?.host);
-          const text = response.data;
+          // Tenant-configured URL: fetched through the SSRF guard.
+          const { buffer } = await safeFetchMedia(this.localProxy?.host, { maxContentLength: 1024 * 1024 });
+          const text = buffer.toString();
           const proxyUrls = text.split('\r\n');
           const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
           const proxyUrl = 'http://' + proxyUrls[rand];
@@ -3027,14 +3029,14 @@ export class BaileysStartupService extends ChannelStartupService {
     }
     if (status.type === 'image') {
       return {
-        content: { image: { url: status.content }, caption: status.caption },
+        content: { image: await this.mediaUrlOrBase64(status.content), caption: status.caption },
         option: { statusJidList: status.statusJidList },
       };
     }
 
     if (status.type === 'video') {
       return {
-        content: { video: { url: status.content }, caption: status.caption },
+        content: { video: await this.mediaUrlOrBase64(status.content), caption: status.caption },
         option: { statusJidList: status.statusJidList },
       };
     }
@@ -3072,38 +3074,17 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       const type = mediaMessage.mediatype === 'ptv' ? 'video' : mediaMessage.mediatype;
 
+      // Tenant-supplied URLs are downloaded here (SSRF-checked) and handed to Baileys as a Buffer.
+      const fetched = isURL(mediaMessage.media) ? await this.fetchMediaUrl(mediaMessage.media) : undefined;
+      const mediaBuffer = fetched ? fetched.buffer : Buffer.from(mediaMessage.media, 'base64');
+
       let mediaInput: any;
       if (mediaMessage.mediatype === 'image') {
-        let imageBuffer: Buffer;
-        if (isURL(mediaMessage.media)) {
-          let config: any = { responseType: 'arraybuffer' };
-
-          if (this.localProxy?.enabled) {
-            config = {
-              ...config,
-              httpsAgent: makeProxyAgent({
-                host: this.localProxy.host,
-                port: this.localProxy.port,
-                protocol: this.localProxy.protocol,
-                username: this.localProxy.username,
-                password: this.localProxy.password,
-              }),
-            };
-          }
-
-          const response = await axios.get(mediaMessage.media, config);
-          imageBuffer = Buffer.from(response.data, 'binary');
-        } else {
-          imageBuffer = Buffer.from(mediaMessage.media, 'base64');
-        }
-
-        mediaInput = await sharp(imageBuffer).jpeg().toBuffer();
+        mediaInput = await sharp(mediaBuffer).jpeg().toBuffer();
         mediaMessage.fileName ??= 'image.jpg';
         mediaMessage.mimetype = 'image/jpeg';
       } else {
-        mediaInput = isURL(mediaMessage.media)
-          ? { url: mediaMessage.media }
-          : Buffer.from(mediaMessage.media, 'base64');
+        mediaInput = mediaBuffer;
       }
 
       const prepareMedia = await prepareWAMessageMedia(
@@ -3136,25 +3117,8 @@ export class BaileysStartupService extends ChannelStartupService {
       } else {
         mimetype = mimeTypes.lookup(mediaMessage.fileName);
 
-        if (!mimetype && isURL(mediaMessage.media)) {
-          let config: any = { responseType: 'arraybuffer' };
-
-          if (this.localProxy?.enabled) {
-            config = {
-              ...config,
-              httpsAgent: makeProxyAgent({
-                host: this.localProxy.host,
-                port: this.localProxy.port,
-                protocol: this.localProxy.protocol,
-                username: this.localProxy.username,
-                password: this.localProxy.password,
-              }),
-            };
-          }
-
-          const response = await axios.get(mediaMessage.media, config);
-
-          mimetype = response.headers['content-type'];
+        if (!mimetype && fetched?.contentType) {
+          mimetype = fetched.contentType;
         }
       }
 
@@ -3167,18 +3131,11 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         try {
-          let mediaInput;
-          if (isURL(mediaMessage.media)) {
-            mediaInput = mediaMessage.media;
-          } else {
-            const mediaBuffer = Buffer.from(mediaMessage.media, 'base64');
-            if (!mediaBuffer || mediaBuffer.length === 0) {
-              throw new Error('Invalid media buffer');
-            }
-            mediaInput = mediaBuffer;
+          if (!mediaBuffer || mediaBuffer.length === 0) {
+            throw new Error('Invalid media buffer');
           }
 
-          const duration = await getVideoDuration(mediaInput);
+          const duration = await getVideoDuration(mediaBuffer);
           if (!duration || duration <= 0) {
             throw new Error('Invalid media duration');
           }
@@ -3214,8 +3171,36 @@ export class BaileysStartupService extends ChannelStartupService {
       );
     } catch (error) {
       this.logger.error(error);
+      if (error?.status === 400) throw error;
       throw new InternalServerErrorException(error?.toString() || error);
     }
+  }
+
+  /** Downloads a tenant-supplied media URL through the SSRF guard, honouring the instance proxy for https. */
+  private async fetchMediaUrl(url: string): Promise<SafeFetchMediaResult> {
+    const proxyAgent = this.localProxy?.enabled
+      ? makeProxyAgent({
+          host: this.localProxy.host,
+          port: this.localProxy.port,
+          protocol: this.localProxy.protocol,
+          username: this.localProxy.username,
+          password: this.localProxy.password,
+        })
+      : undefined;
+
+    try {
+      return await safeFetchMedia(url, { proxyAgent });
+    } catch (error) {
+      if (error instanceof UnsafeMediaUrlError) {
+        throw new BadRequestException(error.message);
+      }
+      throw error;
+    }
+  }
+
+  /** A URL is fetched through the SSRF guard; anything else is treated as base64 (never as a local path). */
+  private async mediaUrlOrBase64(media: string): Promise<Buffer> {
+    return isURL(media) ? (await this.fetchMediaUrl(media)).buffer : Buffer.from(media, 'base64');
   }
 
   private async convertToWebP(image: string): Promise<Buffer> {
@@ -3231,23 +3216,7 @@ export class BaileysStartupService extends ChannelStartupService {
         parsedURL.searchParams.set('timestamp', timestamp.toString());
         const url = parsedURL.toString();
 
-        let config: any = { responseType: 'arraybuffer' };
-
-        if (this.localProxy?.enabled) {
-          config = {
-            ...config,
-            httpsAgent: makeProxyAgent({
-              host: this.localProxy.host,
-              port: this.localProxy.port,
-              protocol: this.localProxy.protocol,
-              username: this.localProxy.username,
-              password: this.localProxy.password,
-            }),
-          };
-        }
-
-        const response = await axios.get(url, config);
-        imageBuffer = Buffer.from(response.data, 'binary');
+        imageBuffer = (await this.fetchMediaUrl(url)).buffer;
       }
 
       const isAnimated = this.isAnimated(image, imageBuffer);
@@ -3358,16 +3327,9 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async processAudioMp4(audio: string) {
-    let inputStream: PassThrough;
-
-    if (isURL(audio)) {
-      const response = await axios.get(audio, { responseType: 'stream' });
-      inputStream = response.data;
-    } else {
-      const audioBuffer = Buffer.from(audio, 'base64');
-      inputStream = new PassThrough();
-      inputStream.end(audioBuffer);
-    }
+    const audioBuffer = await this.mediaUrlOrBase64(audio);
+    const inputStream = new PassThrough();
+    inputStream.end(audioBuffer);
 
     return new Promise<Buffer>((resolve, reject) => {
       const ffmpegProcess = spawn(ffmpegPath.path, [
@@ -3455,10 +3417,8 @@ export class BaileysStartupService extends ChannelStartupService {
         parsedURL.searchParams.set('timestamp', timestamp.toString());
         const url = parsedURL.toString();
 
-        const config: any = { responseType: 'stream' };
-
-        const response = await axios.get(url, config);
-        inputAudioStream = response.data.pipe(new PassThrough());
+        inputAudioStream = new PassThrough();
+        inputAudioStream.end((await this.fetchMediaUrl(url)).buffer);
       } else {
         const audioBuffer = Buffer.from(audio, 'base64');
         inputAudioStream = new PassThrough();
@@ -3562,7 +3522,7 @@ export class BaileysStartupService extends ChannelStartupService {
     return await this.sendMessageWithTyping<AnyMessageContent>(
       data.number,
       {
-        audio: isURL(data.audio) ? { url: data.audio } : Buffer.from(data.audio, 'base64'),
+        audio: await this.mediaUrlOrBase64(data.audio),
         ptt: true,
         mimetype: 'audio/ogg; codecs=opus',
       },
@@ -4159,12 +4119,26 @@ export class BaileysStartupService extends ChannelStartupService {
     return map[mediaType] || null;
   }
 
-  public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
+  /**
+   * @param trustMessageContent internal callers pass a message they received from WhatsApp. The HTTP route
+   * passes false: caller-supplied content (media URL, keys) is ignored and the message stored for this
+   * instance is loaded by key instead, so a tenant cannot make the server fetch arbitrary URLs.
+   */
+  public async getBase64FromMediaMessage(
+    data: getBase64FromMediaMessageDto,
+    getBuffer = false,
+    trustMessageContent = true,
+  ) {
     try {
       const m = data?.message;
       const convertToMp4 = data?.convertToMp4 ?? false;
 
-      const msg = m?.message ? m : ((await this.getMessage(m.key, true)) as proto.IWebMessageInfo);
+      if (!trustMessageContent && !m?.key?.id) {
+        throw new BadRequestException('message.key.id is required');
+      }
+
+      const msg =
+        m?.message && trustMessageContent ? m : ((await this.getMessage(m.key, true)) as proto.IWebMessageInfo);
 
       if (!msg) {
         throw 'Message not found';
@@ -4390,22 +4364,7 @@ export class BaileysStartupService extends ChannelStartupService {
         parsedURL.searchParams.set('timestamp', timestamp.toString());
         const url = parsedURL.toString();
 
-        let config: any = { responseType: 'arraybuffer' };
-
-        if (this.localProxy?.enabled) {
-          config = {
-            ...config,
-            httpsAgent: makeProxyAgent({
-              host: this.localProxy.host,
-              port: this.localProxy.port,
-              protocol: this.localProxy.protocol,
-              username: this.localProxy.username,
-              password: this.localProxy.password,
-            }),
-          };
-        }
-
-        pic = (await axios.get(url, config)).data;
+        pic = (await this.fetchMediaUrl(url)).buffer;
       } else if (isBase64(picture)) {
         pic = Buffer.from(picture, 'base64');
       } else {
@@ -4418,6 +4377,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return { update: 'success' };
     } catch (error) {
+      if (error?.status === 400) throw error;
       throw new InternalServerErrorException('Error updating profile picture', error.toString());
     }
   }
@@ -4684,22 +4644,7 @@ export class BaileysStartupService extends ChannelStartupService {
         parsedURL.searchParams.set('timestamp', timestamp.toString());
         const url = parsedURL.toString();
 
-        let config: any = { responseType: 'arraybuffer' };
-
-        if (this.localProxy?.enabled) {
-          config = {
-            ...config,
-            httpsAgent: makeProxyAgent({
-              host: this.localProxy.host,
-              port: this.localProxy.port,
-              protocol: this.localProxy.protocol,
-              username: this.localProxy.username,
-              password: this.localProxy.password,
-            }),
-          };
-        }
-
-        pic = (await axios.get(url, config)).data;
+        pic = (await this.fetchMediaUrl(url)).buffer;
       } else if (isBase64(picture.image)) {
         pic = Buffer.from(picture.image, 'base64');
       } else {
@@ -4709,6 +4654,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return { update: 'success' };
     } catch (error) {
+      if (error?.status === 400) throw error;
       throw new InternalServerErrorException('Error update group picture', error.toString());
     }
   }

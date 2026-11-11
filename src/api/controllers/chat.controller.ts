@@ -60,7 +60,8 @@ export class ChatController {
   }
 
   public async getBase64FromMediaMessage({ instanceName }: InstanceDto, data: getBase64FromMediaMessageDto) {
-    return await this.waMonitor.waInstances[instanceName].getBase64FromMediaMessage(data);
+    // Baileys: do not trust caller-supplied message content; the stored message is loaded by key (SSRF).
+    return await this.waMonitor.waInstances[instanceName].getBase64FromMediaMessage(data, false, false);
   }
 
   public async fetchMessages({ instanceName }: InstanceDto, query: Query<Message>) {
