@@ -1,4 +1,5 @@
 import { InstanceDto } from '@api/dto/instance.dto';
+import { matchedRoute, ROUTE_CREATE_INSTANCE, ROUTE_FETCH_INSTANCES } from '@api/guards/auth.guard';
 import { cache, prismaRepository, waMonitor } from '@api/server.module';
 import { CacheConf, configService } from '@config/env.config';
 import { BadRequestException, ForbiddenException, InternalServerErrorException, NotFoundException } from '@exceptions';
@@ -23,7 +24,8 @@ async function getInstance(instanceName: string) {
 }
 
 export async function instanceExistsGuard(req: Request, _: Response, next: NextFunction) {
-  if (req.originalUrl.includes('/instance/create') || req.originalUrl.includes('/instance/fetchInstances')) {
+  const route = matchedRoute(req);
+  if (route === ROUTE_CREATE_INSTANCE || route === ROUTE_FETCH_INSTANCES) {
     return next();
   }
 
@@ -40,7 +42,7 @@ export async function instanceExistsGuard(req: Request, _: Response, next: NextF
 }
 
 export async function instanceLoggedGuard(req: Request, _: Response, next: NextFunction) {
-  if (req.originalUrl.includes('/instance/create')) {
+  if (matchedRoute(req) === ROUTE_CREATE_INSTANCE) {
     const instance = req.body as InstanceDto;
     if (await getInstance(instance.instanceName)) {
       throw new ForbiddenException(`This name "${instance.instanceName}" is already in use.`);
