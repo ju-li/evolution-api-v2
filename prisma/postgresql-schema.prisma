@@ -671,6 +671,11 @@ model IsOnWhatsapp {
   lid        String?  @db.VarChar(100)
   createdAt  DateTime @default(now()) @db.Timestamp
   updatedAt  DateTime @updatedAt @db.Timestamp
+
+  // Also indexed by GIN on string_to_array("jidOptions", ',') via the raw-SQL index
+  // "IsOnWhatsapp_jidOptions_elements_idx" (migration 20261111130000_is_on_whatsapp_jid_options_elements_idx), which
+  // serves the exact-entry lookups in src/utils/onWhatsappCache.ts. Prisma can't express expression indexes and
+  // ignores it when diffing, so it doesn't appear here.
 }
 
 model N8n {
