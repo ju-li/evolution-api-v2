@@ -1,7 +1,7 @@
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { Events } from '@api/types/wa.types';
-import { Auth, ConfigService, HttpServer, Typebot } from '@config/env.config';
+import { ConfigService, HttpServer, Typebot } from '@config/env.config';
 import { Instance, IntegrationSession, Message, Typebot as TypebotModel } from '@prisma/client';
 import { getConversationMessage } from '@utils/getConversationMessage';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -100,7 +100,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
             pushName: data.pushName || data.prefilledVariables?.pushName || '',
             instanceName: instance.name,
             serverUrl: this.configService.get<HttpServer>('SERVER').URL,
-            apiKey: this.configService.get<Auth>('AUTHENTICATION').API_KEY.KEY,
+            apiKey: instance.token,
             ownerJid: instance.number,
           },
         };
@@ -116,7 +116,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
               pushName: data.pushName || data.prefilledVariables?.pushName || '',
               instanceName: instance.name,
               serverUrl: this.configService.get<HttpServer>('SERVER').URL,
-              apiKey: this.configService.get<Auth>('AUTHENTICATION').API_KEY.KEY,
+              apiKey: instance.token,
               ownerJid: instance.number,
             },
           },
@@ -138,7 +138,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
               pushName: data.pushName || '',
               instanceName: instance.name,
               serverUrl: this.configService.get<HttpServer>('SERVER').URL,
-              apiKey: this.configService.get<Auth>('AUTHENTICATION').API_KEY.KEY,
+              apiKey: instance.token,
               ownerJid: instance.number,
             },
             awaitUser: false,
