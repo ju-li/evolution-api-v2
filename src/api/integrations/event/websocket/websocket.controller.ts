@@ -2,10 +2,16 @@ import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { Auth, configService, Cors, Log, Websocket } from '@config/env.config';
 import { Logger } from '@config/logger.config';
-import { Server } from 'http';
-import { Server as SocketIO } from 'socket.io';
+import { IncomingMessage, Server } from 'http';
+import { Namespace, Server as SocketIO, Socket } from 'socket.io';
 
 import { EmitData, EventController, EventControllerInterface } from '../event.controller';
+
+// Principal bound at handshake: '*' for the global key or an allowlisted host, otherwise the instance name.
+type PrincipalRequest = IncomingMessage & { wsPrincipal?: string };
+
+const GLOBAL_PRINCIPAL = '*';
+const GLOBAL_ROOM = 'global';
 
 export class WebsocketController extends EventController implements EventControllerInterface {
   private io: SocketIO;
@@ -42,6 +48,7 @@ export class WebsocketController extends EventController implements EventControl
               .includes(remoteAddress);
 
           if (params.has('EIO') && isAllowedHost) {
+            (req as PrincipalRequest).wsPrincipal = GLOBAL_PRINCIPAL;
             return callback(null, true);
           }
 
@@ -62,6 +69,7 @@ export class WebsocketController extends EventController implements EventControl
             }
           }
 
+          (req as PrincipalRequest).wsPrincipal = instance ? instance.name : GLOBAL_PRINCIPAL;
           callback(null, true);
         } catch (error) {
           this.logger.error('Authentication error:');
@@ -71,14 +79,45 @@ export class WebsocketController extends EventController implements EventControl
       },
     });
 
+    // Bind every namespace (root, /<instance> created on emit or on connect) to the handshake principal.
+    const bindPrincipal = (socket: Socket, next: (err?: Error) => void) => {
+      const principal = (socket.request as PrincipalRequest).wsPrincipal;
+      const namespace = socket.nsp.name.slice(1);
+
+      if (!principal) {
+        return next(new Error('Unauthorized'));
+      }
+
+      if (namespace && principal !== GLOBAL_PRINCIPAL && principal !== namespace) {
+        this.logger.error(`Connection rejected: token not allowed for namespace /${namespace}`);
+        return next(new Error('Forbidden'));
+      }
+
+      socket.data.principal = principal;
+      next();
+    };
+
+    this.socket.use(bindPrincipal);
+    this.socket.on('new_namespace', (namespace: Namespace) => namespace.use(bindPrincipal));
+
     this.socket.on('connection', (socket) => {
       this.logger.info('User connected');
+
+      if (socket.data.principal === GLOBAL_PRINCIPAL) {
+        socket.join(GLOBAL_ROOM);
+      }
 
       socket.on('disconnect', () => {
         this.logger.info('User disconnected');
       });
 
       socket.on('sendNode', async (data) => {
+        const principal = socket.data.principal;
+        if (principal !== GLOBAL_PRINCIPAL && principal !== data?.instanceId) {
+          this.logger.error('sendNode rejected: token not allowed for this instance');
+          return;
+        }
+
         try {
           await this.waMonitor.waInstances[data.instanceId].baileysSendNode(data.stanza);
           this.logger.info('Node sent successfully');
@@ -142,7 +181,7 @@ export class WebsocketController extends EventController implements EventControl
     };
 
     if (configService.get<Websocket>('WEBSOCKET')?.GLOBAL_EVENTS) {
-      this.socket.emit(event, message);
+      this.socket.to(GLOBAL_ROOM).emit(event, message);
 
       if (logEnabled) {
         this.logger.log({ local: `${origin}.sendData-WebsocketGlobal`, ...message });
