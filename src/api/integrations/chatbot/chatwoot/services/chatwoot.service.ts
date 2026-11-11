@@ -2665,12 +2665,12 @@ export class ChatwootService {
       const inbox = await this.getInbox(instance);
 
       const sqlMessages = `select * from messages m
-      where account_id = ${chatwootConfig.accountId}
-      and inbox_id = ${inbox.id}
+      where account_id = $1
+      and inbox_id = $2
       and created_at >= now() - interval '6h'
       order by created_at desc`;
 
-      const messagesData = (await this.pgClient.query(sqlMessages))?.rows;
+      const messagesData = (await this.pgClient.query(sqlMessages, [chatwootConfig.accountId, inbox.id]))?.rows;
       const ids: string[] = messagesData
         .filter((message) => !!message.source_id)
         .map((message) => message.source_id.replace('WAID:', ''));
