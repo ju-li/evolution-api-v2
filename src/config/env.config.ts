@@ -3,6 +3,36 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// Global API keys that are published in this repository (example env files, manifests) or were a hardcoded fallback.
+// Anyone can read them, so the server must never accept one of them as its global admin key.
+const PUBLIC_API_KEYS = ['429683C4C977415CAAFCCE10F7D57E11', 'BQYHJGJHJ'];
+const RECOMMENDED_API_KEY_LENGTH = 32;
+
+/**
+ * Reads AUTHENTICATION_API_KEY and fails closed: a missing, blank or publicly known key would hand global admin
+ * access to anyone, so startup stops instead. A short key only warns, so existing deployments keep starting.
+ */
+function readGlobalApiKey(value = process.env.AUTHENTICATION_API_KEY): string {
+  const key = value?.trim();
+  if (!key) {
+    throw new Error(
+      'AUTHENTICATION_API_KEY is not set. Set it to a unique random secret (e.g. `openssl rand -hex 32`).',
+    );
+  }
+  if (PUBLIC_API_KEYS.some((publicKey) => publicKey.toLowerCase() === key.toLowerCase())) {
+    throw new Error(
+      'AUTHENTICATION_API_KEY is set to a publicly known example value. Replace it with a unique random secret (e.g. `openssl rand -hex 32`).',
+    );
+  }
+  if (key.length < RECOMMENDED_API_KEY_LENGTH) {
+    // The Logger depends on this module, so warn through Node directly.
+    process.emitWarning(
+      `AUTHENTICATION_API_KEY is shorter than ${RECOMMENDED_API_KEY_LENGTH} characters; use a longer random secret.`,
+    );
+  }
+  return key;
+}
+
 export type HttpServer = {
   NAME: string;
   TYPE: 'http' | 'https';
@@ -879,7 +909,7 @@ export class ConfigService {
       },
       AUTHENTICATION: {
         API_KEY: {
-          KEY: process.env.AUTHENTICATION_API_KEY || 'BQYHJGJHJ',
+          KEY: readGlobalApiKey(),
         },
         EXPOSE_IN_FETCH_INSTANCES: process.env?.AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES === 'true',
       },

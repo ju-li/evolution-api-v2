@@ -19,7 +19,10 @@ COPY ./src ./src
 COPY ./public ./public
 COPY ./prisma ./prisma
 COPY ./manager ./manager
+# Build-time defaults only (generate_database.sh reads DATABASE_PROVIDER from it). The example global API key is
+# stripped: it is public, so the image must never fall back to it. Operators must set AUTHENTICATION_API_KEY.
 COPY ./.env.example ./.env
+RUN sed -i '/^AUTHENTICATION_API_KEY=/d' ./.env
 COPY ./runWithProvider.js ./
 
 COPY ./Docker ./Docker
