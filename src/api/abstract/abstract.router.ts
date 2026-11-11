@@ -31,7 +31,9 @@ export abstract class RouterBroker {
 
     const ref = new ClassRef();
     const body = request.body;
-    const instance = request.params as unknown as InstanceDto;
+    // Build a fresh DTO: query/body may supply extra fields, but the route's :instanceName (the one the auth guard
+    // checked) is applied last so it can never be overridden by the caller.
+    const instance = { ...request.params } as unknown as InstanceDto;
 
     if (request?.query && Object.keys(request.query).length > 0) {
       Object.assign(instance, request.query);
@@ -39,6 +41,10 @@ export abstract class RouterBroker {
 
     if (request.originalUrl.includes('/instance/create')) {
       Object.assign(instance, body);
+    }
+
+    if (request.params?.instanceName) {
+      instance.instanceName = request.params.instanceName;
     }
 
     Object.assign(ref, body);
