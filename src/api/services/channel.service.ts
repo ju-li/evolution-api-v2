@@ -53,6 +53,11 @@ function collectSearchTerms(value: unknown, terms: string[] = []): string[] {
   return terms;
 }
 
+/** muteEndTime is a BigInt column, which JSON can't serialise. */
+function muteEndTimeToNumber(value: bigint | number | null | undefined): number | null {
+  return value == null ? null : Number(value);
+}
+
 function hasValue(value: unknown) {
   return value !== undefined && value !== null && value !== '';
 }
@@ -683,21 +688,21 @@ export class ChannelStartupService {
 
     const queryFilters = this.messageQueryFilters(query?.where);
 
-    const count = await this.prismaRepository.message.count({
-      where: {
-        instanceId: this.instanceId,
-        id: query?.where?.id,
-        source: query?.where?.source,
-        messageType: query?.where?.messageType,
-        AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-          keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
-          ...queryFilters,
-        ],
-      },
-    });
+    const where: Prisma.MessageWhereInput = {
+      instanceId: this.instanceId,
+      id: query?.where?.id,
+      source: query?.where?.source,
+      messageType: query?.where?.messageType,
+      AND: [
+        keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
+        typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } } : {},
+        keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
+        keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+        ...queryFilters,
+      ],
+    };
+
+    const count = await this.prismaRepository.message.count({ where });
 
     if (!query?.offset) {
       query.offset = 50;
@@ -708,19 +713,7 @@ export class ChannelStartupService {
     }
 
     const messages = await this.prismaRepository.message.findMany({
-      where: {
-        instanceId: this.instanceId,
-        id: query?.where?.id,
-        source: query?.where?.source,
-        messageType: query?.where?.messageType,
-        AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-          keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
-          ...queryFilters,
-        ],
-      },
+      where,
       orderBy: {
         messageTimestamp: 'desc',
       },
@@ -789,8 +782,7 @@ export class ChannelStartupService {
       },
     });
 
-    // muteEndTime is a BigInt column, which JSON can't serialise.
-    return chat ? { ...chat, muteEndTime: chat.muteEndTime === null ? null : Number(chat.muteEndTime) } : chat;
+    return chat ? { ...chat, muteEndTime: muteEndTimeToNumber(chat.muteEndTime) } : chat;
   }
 
   public async fetchChats(query: any) {
@@ -902,8 +894,7 @@ export class ChannelStartupService {
           unreadCount: contact.unreadMessages,
           archived: contact.archived ?? false,
           pinned: contact.pinned ?? false,
-          muteEndTime:
-            contact.muteEndTime === null || contact.muteEndTime === undefined ? null : Number(contact.muteEndTime),
+          muteEndTime: muteEndTimeToNumber(contact.muteEndTime),
           markedAsUnread: contact.markedAsUnread ?? false,
           isSaved: !!contact.contactId,
         };

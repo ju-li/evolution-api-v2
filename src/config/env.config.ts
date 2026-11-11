@@ -21,19 +21,9 @@ export type Cors = {
 
 export type LogBaileys = 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace';
 
-export type LogLevel = 'ERROR' | 'WARN' | 'DEBUG' | 'INFO' | 'LOG' | 'VERBOSE' | 'DARK' | 'WEBHOOKS' | 'WEBSOCKET';
+const ALL_LOG_LEVELS = ['ERROR', 'WARN', 'DEBUG', 'INFO', 'LOG', 'VERBOSE', 'DARK', 'WEBHOOKS', 'WEBSOCKET'] as const;
 
-const ALL_LOG_LEVELS: LogLevel[] = [
-  'ERROR',
-  'WARN',
-  'DEBUG',
-  'INFO',
-  'LOG',
-  'VERBOSE',
-  'DARK',
-  'WEBHOOKS',
-  'WEBSOCKET',
-];
+export type LogLevel = (typeof ALL_LOG_LEVELS)[number];
 
 /**
  * Parses LOG_LEVEL (comma-separated). Entries are trimmed and upper-cased, so "ERROR, WARN" keeps WARN.

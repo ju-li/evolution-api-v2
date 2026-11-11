@@ -80,7 +80,7 @@ import { BadRequestException, InternalServerErrorException, NotFoundException } 
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
-import { Instance, Message } from '@prisma/client';
+import { Instance, Message, Prisma } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
@@ -166,15 +166,18 @@ export interface ExtendedIMessageKey extends proto.IMessageKey {
 
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
 
+/** Chat state synced from WhatsApp app state / history (see #1). Only the fields an update carries are set. */
+type ChatState = { archived?: boolean; pinned?: boolean; muteEndTime?: number | null; markedAsUnread?: boolean };
+
+/** Baileys websocket call events forwarded as Events.CALL. */
+const CALL_EVENTS = ['CB:call', 'CB:ack,class:call'] as const;
+
 /**
  * Reconnect policy for retryable closes (see #10). Delay before attempt N is RECONNECT_DELAYS_MS[N - 1], and the last
  * value repeats. After MAX_RECONNECT_ATTEMPTS the instance stops (session kept) instead of looping for hours.
  * The attempt counter resets only after the connection has stayed open for STABLE_CONNECTION_MS: in a 440 loop every
  * attempt briefly reaches 'open', so resetting on any open would never run out.
  */
-/** Chat state synced from WhatsApp app state / history (see #1). Only the fields an update carries are set. */
-type ChatState = { archived?: boolean; pinned?: boolean; muteEndTime?: number | null; markedAsUnread?: boolean };
-
 export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
 export const MAX_RECONNECT_ATTEMPTS = 20;
 export const STABLE_CONNECTION_MS = 60_000;
@@ -536,32 +539,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       } else {
         this.stopReconnecting();
-
-        this.sendDataWebhook(Events.STATUS_INSTANCE, {
-          instance: this.instance.name,
-          status: 'closed',
-          disconnectionAt: new Date(),
-          disconnectionReasonCode: statusCode,
-          disconnectionObject: JSON.stringify(lastDisconnect),
-        });
-
-        await this.prismaRepository.instance.update({
-          where: { id: this.instanceId },
-          data: {
-            connectionStatus: 'close',
-            disconnectionAt: new Date(),
-            disconnectionReasonCode: statusCode,
-            disconnectionObject: JSON.stringify(lastDisconnect),
-          },
-        });
-
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          this.chatwootService.eventWhatsapp(
-            Events.STATUS_INSTANCE,
-            { instanceName: this.instance.name, instanceId: this.instanceId },
-            { instance: this.instance.name, status: 'closed' },
-          );
-        }
+        await this.markClosed(statusCode, lastDisconnect);
 
         this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
         this.client?.ws?.close();
@@ -703,19 +681,15 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     try {
-      previous.ws?.removeAllListeners('CB:call');
-      previous.ws?.removeAllListeners('CB:ack,class:call');
+      CALL_EVENTS.forEach((event) => previous.ws?.removeAllListeners(event));
     } catch {
       // ignore
     }
 
-    try {
-      Promise.resolve(previous.end(undefined)).catch((error) =>
-        this.logger.warn(`Error ending replaced socket: ${error?.message ?? error}`),
-      );
-    } catch (error) {
-      this.logger.warn(`Error ending replaced socket: ${error?.message ?? error}`);
-    }
+    // .then() turns a synchronous throw from end() into a rejection, so one handler covers both.
+    Promise.resolve()
+      .then(() => previous.end(undefined))
+      .catch((error) => this.logger.warn(`Error ending replaced socket: ${error?.message ?? error}`));
   }
 
   /**
@@ -878,19 +852,13 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.eventHandler(client, generation);
 
-    client.ws.on('CB:call', (packet) => {
-      if (generation !== this.clientGeneration) return;
-      this.logger.verbose({ event: 'CB:call', packet });
-      const payload = { event: 'CB:call', packet: packet };
-      this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    });
-
-    client.ws.on('CB:ack,class:call', (packet) => {
-      if (generation !== this.clientGeneration) return;
-      this.logger.verbose({ event: 'CB:ack,class:call', packet });
-      const payload = { event: 'CB:ack,class:call', packet: packet };
-      this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    });
+    for (const event of CALL_EVENTS) {
+      client.ws.on(event, (packet) => {
+        if (generation !== this.clientGeneration) return;
+        this.logger.verbose({ event, packet });
+        this.sendDataWebhook(Events.CALL, { event, packet }, true, ['websocket']);
+      });
+    }
 
     this.phoneNumber = number;
 
@@ -1011,15 +979,7 @@ export class BaileysStartupService extends ChannelStartupService {
     this.stateConnection = { state: 'connecting', statusReason: statusCode };
 
     try {
-      await this.prismaRepository.instance.update({
-        where: { id: this.instanceId },
-        data: {
-          connectionStatus: 'connecting',
-          disconnectionAt: new Date(),
-          disconnectionReasonCode: statusCode,
-          disconnectionObject: JSON.stringify(lastDisconnect),
-        },
-      });
+      await this.recordDisconnection('connecting', new Date(), statusCode, JSON.stringify(lastDisconnect));
     } catch (error) {
       this.logger.error(`Failed to record reconnecting status: ${error?.message ?? error}`);
     }
@@ -1041,6 +1001,26 @@ export class BaileysStartupService extends ChannelStartupService {
     );
 
     this.stateConnection = { state: 'close', statusReason: statusCode };
+    await this.markClosed(statusCode, lastDisconnect);
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+  }
+
+  /** Stores the disconnection on the instance row with the given status. */
+  private recordDisconnection(
+    connectionStatus: 'close' | 'connecting',
+    disconnectionAt: Date,
+    disconnectionReasonCode: number | undefined,
+    disconnectionObject: string,
+  ) {
+    return this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: { connectionStatus, disconnectionAt, disconnectionReasonCode, disconnectionObject },
+    });
+  }
+
+  /** A non-retried close: STATUS_INSTANCE 'closed' webhook, the stored disconnection, and the Chatwoot event. */
+  private async markClosed(statusCode: number | undefined, lastDisconnect?: ConnectionState['lastDisconnect']) {
     const disconnectionAt = new Date();
     const disconnectionObject = JSON.stringify(lastDisconnect);
 
@@ -1052,15 +1032,7 @@ export class BaileysStartupService extends ChannelStartupService {
       disconnectionObject,
     });
 
-    await this.prismaRepository.instance.update({
-      where: { id: this.instanceId },
-      data: {
-        connectionStatus: 'close',
-        disconnectionAt,
-        disconnectionReasonCode: statusCode,
-        disconnectionObject,
-      },
-    });
+    await this.recordDisconnection('close', disconnectionAt, statusCode, disconnectionObject);
 
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
       this.chatwootService.eventWhatsapp(
@@ -1069,8 +1041,6 @@ export class BaileysStartupService extends ChannelStartupService {
         { instance: this.instance.name, status: 'closed' },
       );
     }
-
-    this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
   }
 
   public async reloadConnection(): Promise<WASocket> {
@@ -1117,11 +1087,12 @@ export class BaileysStartupService extends ChannelStartupService {
       >[],
     ) => {
       // App-state updates are partial: forward and store only the fields each update carries (see #1).
-      const chatsRaw = chats.map((chat) => {
+      const states = chats.map((chat) => ({ remoteJid: chat.id, state: this.chatStateFrom(chat) }));
+      const chatsRaw = chats.map((chat, i) => {
         const raw: Record<string, unknown> = {
           remoteJid: chat.id,
           instanceId: this.instanceId,
-          ...this.chatStateFrom(chat),
+          ...states[i].state,
         };
         if (typeof chat.unreadCount === 'number') {
           raw.unreadCount = chat.unreadCount;
@@ -1131,16 +1102,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
 
+      await this.refreshChatStates(states);
+
       const readOnPhone = new Map<string, number>();
       for (const chat of chats) {
-        const state = this.chatStateFrom(chat);
-        if (Object.keys(state).length > 0) {
-          await this.prismaRepository.chat.updateMany({
-            where: { instanceId: this.instanceId, remoteJid: chat.id },
-            data: state,
-          });
-        }
-
         // unreadCount 0 = read on the phone (authoritative). Positive values are increments Baileys derives from new
         // messages, which the status-based recount already covers; -1 = marked as unread (stored as markedAsUnread).
         if (chat.unreadCount === 0) {
@@ -5383,7 +5348,7 @@ export class BaileysStartupService extends ChannelStartupService {
     return counts;
   }
 
-  /** Writes history-sync state onto chats that already exist, in batched transactions. */
+  /** Writes synced chat state onto chats that already exist, in batched transactions. */
   private async refreshChatStates(chats: { remoteJid: string; state: ChatState }[]) {
     const updates = chats.filter((chat) => Object.keys(chat.state).length > 0);
     for (let i = 0; i < updates.length; i += 200) {
@@ -5679,26 +5644,26 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const queryFilters = this.messageQueryFilters(query?.where);
 
-    const count = await this.prismaRepository.message.count({
-      where: {
-        instanceId: this.instanceId,
-        id: query?.where?.id,
-        source: query?.where?.source,
-        messageType: query?.where?.messageType,
-        AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } } : {},
-          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
-          {
-            OR: [
-              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-              keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
-            ],
-          },
-          ...queryFilters,
-        ],
-      },
-    });
+    const where: Prisma.MessageWhereInput = {
+      instanceId: this.instanceId,
+      id: query?.where?.id,
+      source: query?.where?.source,
+      messageType: query?.where?.messageType,
+      AND: [
+        keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
+        typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } } : {},
+        keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+        {
+          OR: [
+            keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
+            keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
+          ],
+        },
+        ...queryFilters,
+      ],
+    };
+
+    const count = await this.prismaRepository.message.count({ where });
 
     if (!query?.offset) {
       query.offset = 50;
@@ -5709,24 +5674,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     const messages = await this.prismaRepository.message.findMany({
-      where: {
-        instanceId: this.instanceId,
-        id: query?.where?.id,
-        source: query?.where?.source,
-        messageType: query?.where?.messageType,
-        AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters.fromMe } } : {},
-          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
-          {
-            OR: [
-              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-              keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
-            ],
-          },
-          ...queryFilters,
-        ],
-      },
+      where,
       orderBy: { messageTimestamp: 'desc' },
       skip: query.offset * (query?.page === 1 ? 0 : (query?.page as number) - 1),
       take: query.offset,
