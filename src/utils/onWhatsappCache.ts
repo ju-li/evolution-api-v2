@@ -1,6 +1,7 @@
 import { prismaRepository } from '@api/server.module';
 import { configService, Database } from '@config/env.config';
 import { Logger } from '@config/logger.config';
+import { IsOnWhatsapp } from '@prisma/client';
 import dayjs from 'dayjs';
 
 const logger = new Logger('OnWhatsappCache');
@@ -72,6 +73,75 @@ function normalizeJid(jid: string | null | undefined): string | null {
   return jid.startsWith('+') ? jid.slice(1) : jid;
 }
 
+// jidOptions is a comma-joined list of JIDs. Lookups match whole entries, never substrings: a substring test finds
+// '15511987654321@s.whatsapp.net' when asked for '5511987654321@s.whatsapp.net', and saveOnWhatsappCache() would then
+// merge one number's JIDs into another number's row (see #32).
+//
+// On PostgreSQL this is `string_to_array("jidOptions", ',') && $1::text[]`, served by the GIN index
+// "IsOnWhatsapp_jidOptions_elements_idx". The WHERE expression must stay exactly `string_to_array("jidOptions", ',')`,
+// or the planner silently stops using the index. Prisma can't express `&&` on an expression, hence $queryRaw.
+// MySQL keeps the Prisma `contains` query and drops the substring-only matches afterwards.
+
+function isPostgres(): boolean {
+  return ['postgresql', 'psql_bouncer'].includes(configService.get<Database>('DATABASE').PROVIDER);
+}
+
+function hasJidOption(record: Pick<IsOnWhatsapp, 'jidOptions'>, jids: Set<string>): boolean {
+  return record.jidOptions.split(',').some((jid) => jids.has(jid));
+}
+
+/**
+ * The row to merge `remoteJid` into: one listing any of `jids` (its spellings, `remoteJid` included), or stored under
+ * one of them as its remoteJid. When several match, `remoteJid`'s own row wins.
+ */
+async function findRecordToMerge(remoteJid: string, jids: string[]): Promise<IsOnWhatsapp | null> {
+  const wanted = new Set(jids);
+  let matches: IsOnWhatsapp[];
+
+  if (isPostgres()) {
+    // No LIMIT 1: the planner guesses hundreds of matches for `&&` and, under a LIMIT, bets on a sequential scan that
+    // stops early. Without it both branches use their index (BitmapOr). A number matches a row or two.
+    matches = await prismaRepository.$queryRaw<IsOnWhatsapp[]>`
+      SELECT "id", "remoteJid", "jidOptions", "lid", "createdAt", "updatedAt"
+      FROM "IsOnWhatsapp"
+      WHERE string_to_array("jidOptions", ',') && ${jids}::text[]
+         OR "remoteJid" = ANY(${jids}::text[])
+    `;
+  } else {
+    const candidates = await prismaRepository.isOnWhatsapp.findMany({
+      where: {
+        OR: [...jids.map((jid) => ({ jidOptions: { contains: jid } })), { remoteJid: { in: jids } }],
+      },
+    });
+    matches = candidates.filter((record) => wanted.has(record.remoteJid) || hasJidOption(record, wanted));
+  }
+
+  return matches.find((record) => record.remoteJid === remoteJid) ?? matches[0] ?? null;
+}
+
+/** Rows listing any of `jids`, saved at or after `since`. */
+async function findCachedRecords(jids: string[], since: Date): Promise<IsOnWhatsapp[]> {
+  if (isPostgres()) {
+    // "updatedAt" is a timestamp without time zone holding UTC (Prisma writes it so). Casting the ISO string drops
+    // its 'Z' and compares UTC to UTC whatever the session time zone is.
+    return prismaRepository.$queryRaw<IsOnWhatsapp[]>`
+      SELECT "id", "remoteJid", "jidOptions", "lid", "createdAt", "updatedAt"
+      FROM "IsOnWhatsapp"
+      WHERE string_to_array("jidOptions", ',') && ${jids}::text[]
+        AND "updatedAt" >= ${since.toISOString()}::timestamp
+    `;
+  }
+
+  const wanted = new Set(jids);
+  const candidates = await prismaRepository.isOnWhatsapp.findMany({
+    where: {
+      OR: jids.map((jid) => ({ jidOptions: { contains: jid } })),
+      updatedAt: { gte: since },
+    },
+  });
+  return candidates.filter((record) => hasJidOption(record, wanted));
+}
+
 export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
   if (!configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP) {
     return;
@@ -100,14 +170,8 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
       // Às vezes acontece do remoteJid atual NÃO ESTAR no jidOptions ainda, ocasionando o erro:
       // 'Unique constraint failed on the fields: (`remoteJid`)'
       // Isso acontece principalmente em grupos que possuem o número do criador no ID (ex.: '559911223345-1234567890@g.us')
-      const existingRecord = await prismaRepository.isOnWhatsapp.findFirst({
-        where: {
-          OR: [
-            ...expandedJids.map((jid) => ({ jidOptions: { contains: jid } })),
-            { remoteJid: remoteJid }, // TODO: Descobrir o motivo que causa o remoteJid não estar (às vezes) incluso na lista de jidOptions
-          ],
-        },
-      });
+      // TODO: Descobrir o motivo que causa o remoteJid não estar (às vezes) incluso na lista de jidOptions
+      const existingRecord = await findRecordToMerge(remoteJid, [...new Set([...expandedJids, remoteJid])]);
 
       logger.verbose(
         `[saveOnWhatsappCache] Register exists for [${expandedJids.join(',')}]? => ${existingRecord ? existingRecord.remoteJid : 'Not found'}`,
@@ -190,16 +254,15 @@ export async function getOnWhatsappCache(remoteJids: string[]) {
   }[] = [];
 
   if (configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP) {
-    const remoteJidsWithoutPlus = remoteJids.map((remoteJid) => getAvailableNumbers(remoteJid)).flat();
+    const remoteJidsWithoutPlus = [...new Set(remoteJids.flatMap((remoteJid) => getAvailableNumbers(remoteJid)))];
+    if (remoteJidsWithoutPlus.length === 0) {
+      return results;
+    }
 
-    const onWhatsappCache = await prismaRepository.isOnWhatsapp.findMany({
-      where: {
-        OR: remoteJidsWithoutPlus.map((remoteJid) => ({ jidOptions: { contains: remoteJid } })),
-        updatedAt: {
-          gte: dayjs().subtract(configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP_DAYS, 'days').toDate(),
-        },
-      },
-    });
+    const onWhatsappCache = await findCachedRecords(
+      remoteJidsWithoutPlus,
+      dayjs().subtract(configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP_DAYS, 'days').toDate(),
+    );
 
     results = onWhatsappCache.map((item) => ({
       remoteJid: item.remoteJid,
