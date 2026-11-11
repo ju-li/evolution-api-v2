@@ -51,11 +51,12 @@ function getAvailableNumbers(remoteJid: string) {
   }
 
   // Other countries
+  // Push the bare number: the domain is appended below, so pushing remoteJid stored and searched for
+  // '<number>@s.whatsapp.net@s.whatsapp.net' (see #30).
   else {
-    numbersAvailable.push(remoteJid);
+    numbersAvailable.push(number);
   }
 
-  // TODO: Adiciona @domain apenas para números que não são @lid
   return numbersAvailable.map((number) => `${number}@${domain}`);
 }
 
@@ -63,6 +64,12 @@ interface ISaveOnWhatsappCacheParams {
   remoteJid: string;
   remoteJidAlt?: string;
   lid?: 'lid' | undefined;
+}
+
+// Entries written before #30 was fixed carry the domain twice ('<number>@s.whatsapp.net@s.whatsapp.net').
+// The migration rewrites existing rows; this keeps a row clean if an old build writes one again (e.g. mid-deploy).
+function repairDoubledDomain(jid: string): string {
+  return jid.replace(/@s\.whatsapp\.net@s\.whatsapp\.net$/, '@s.whatsapp.net');
 }
 
 function normalizeJid(jid: string | null | undefined): string | null {
@@ -119,7 +126,7 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
       }
 
       if (existingRecord?.jidOptions) {
-        existingRecord.jidOptions.split(',').forEach((jid) => finalJidOptions.add(jid));
+        existingRecord.jidOptions.split(',').forEach((jid) => finalJidOptions.add(repairDoubledDomain(jid)));
       }
 
       // 3. Prepara o payload final

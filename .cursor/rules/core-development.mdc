@@ -92,7 +92,7 @@ alwaysApply: true
 ## Communication Standards
 
 ### Language Requirements
-- **User Communication**: Always respond in Portuguese (PT-BR)
+- **User Communication**: Always respond in English
 - **Code Comments**: English for technical documentation
 - **API Documentation**: English for consistency
 - **Error Messages**: Portuguese for user-facing errors

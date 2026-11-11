@@ -177,7 +177,7 @@ Critical configurations:
 The project follows comprehensive development standards defined in `.cursor/rules/`:
 
 ### Core Principles
-- **Always respond in Portuguese (PT-BR)** for user communication
+- **Always respond in English** for user communication
 - **Follow established architecture patterns** (Service Layer, RouterBroker, etc.)
 - **Robust error handling** with retry logic and graceful degradation
 - **Multi-database compatibility** (PostgreSQL and MySQL)
